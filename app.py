@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import os
@@ -7,19 +6,19 @@ from io import BytesIO
 class SchoolCodeGenerator:
     def __init__(self):
         self.state_codes = {
-            'abia': '01', 'adamawa': '02', 'akwa ibom': '03', 'anambra': '04',
-            'bauchi': '05', 'bayelsa': '06', 'benue': '07', 'borno': '08',
-            'cross river': '09', 'delta': '10', 'ebonyi': '11', 'edo': '12',
-            'ekiti': '13', 'enugu': '14', 'gombe': '15', 'imo': '16',
-            'jigawa': '17', 'kaduna': '18', 'kano': '19', 'katsina': '20',
-            'kebbi': '21', 'kogi': '22', 'kwara': '23', 'lagos': '24',
-            'nasarawa': '25', 'niger': '26', 'ogun': '27', 'ondo': '28',
-            'osun': '29', 'oyo': '30', 'plateau': '31', 'rivers': '32',
-            'sokoto': '33', 'taraba': '34', 'yobe': '35', 'zamfara': '36',
-            'fct': '37'
-        }
+                'abia': '01', 'adamawa': '02', 'akwa ibom': '03', 'anambra': '04',
+                'bauchi': '05', 'bayelsa': '06', 'benue': '07', 'borno': '08',
+                'cross river': '09', 'delta': '10', 'ebonyi': '11', 'edo': '12',
+                'ekiti': '13', 'enugu': '14', 'gombe': '15', 'imo': '16',
+                'jigawa': '17', 'kaduna': '18', 'kano': '19', 'katsina': '20',
+                'kebbi': '21', 'kogi': '22', 'kwara': '23', 'lagos': '24',
+                'nasarawa': '25', 'niger': '26', 'ogun': '27', 'ondo': '28',
+                'osun': '29', 'oyo': '30', 'plateau': '31', 'rivers': '32',
+                'sokoto': '33', 'taraba': '34', 'yobe': '35', 'zamfara': '36',
+                'fct': '37'
+            }
         
-        # COMPLETE LGA codes for ALL states
+        # LGA codes for each state (in official ascending order)
         self.lga_codes = {
             'abia': {
                 "Aba North": "01", "Aba South": "02", "Arochukwu": "03", "Bende": "04",
@@ -307,8 +306,7 @@ class SchoolCodeGenerator:
                 "Kwali": "05", "Municipal Area Council": "06"
             }
         }
-
-    # Rest of the class methods remain the same...
+    
     def get_state_code(self, state_name):
         state_name_lower = state_name.lower()
         return self.state_codes.get(state_name_lower)
@@ -331,7 +329,7 @@ class SchoolCodeGenerator:
         if state_name_lower in self.lga_codes:
             return list(self.lga_codes[state_name_lower].keys())
         return []
-
+    
     def read_existing_codes(self, uploaded_file):
         try:
             if uploaded_file.name.endswith('.csv'):
@@ -422,8 +420,10 @@ def main():
     st.title("🏫 Nigeria School Code Generator")
     st.markdown("Generate unique school codes for all Nigerian states and LGAs")
     
+    # Initialize generator
     generator = SchoolCodeGenerator()
     
+    # Sidebar for navigation
     st.sidebar.title("Navigation")
     app_mode = st.sidebar.radio("Choose Mode", ["Generate Codes", "State Information", "About"])
     
@@ -445,6 +445,7 @@ def generate_codes_ui(generator):
             sorted([state.title() for state in generator.state_codes.keys()])
         )
         
+        # Get LGAs for selected state
         lgas = generator.get_all_lgas_for_state(state_name)
         
         if lgas:
@@ -468,18 +469,24 @@ def generate_codes_ui(generator):
             "Number of schools per LGA",
             min_value=1,
             max_value=1000,
-            value=5
+            value=5,
+            help="Number of school codes to generate for each selected LGA"
         )
         
         st.subheader("Existing Codes (Optional)")
         existing_file = st.file_uploader(
             "Upload existing school codes file",
-            type=['csv', 'xlsx', 'xls', 'txt']
+            type=['csv', 'xlsx', 'xls', 'txt'],
+            help="Upload a file with existing codes to avoid duplicates"
         )
     
     if st.button("Generate School Codes", type="primary"):
-        if not state_name or not selected_lgas:
-            st.error("Please select a state and at least one LGA")
+        if not state_name:
+            st.error("Please select a state")
+            return
+        
+        if not selected_lgas:
+            st.error("Please select at least one LGA")
             return
         
         with st.spinner("Generating school codes..."):
@@ -496,11 +503,13 @@ def generate_codes_ui(generator):
             st.error("No codes were generated. Please check your inputs.")
 
 def display_results(generated_codes, state_name):
-    st.success(f"Successfully generated {len(generated_codes)} school codes for {state_name}!")
+    st.success(f"✅ Successfully generated {len(generated_codes)} school codes for {state_name}!")
     
+    # Create DataFrame
     df = pd.DataFrame(generated_codes)
     
-    st.subheader("Summary")
+    # Display summary
+    st.subheader("📊 Summary")
     summary = df.groupby(['LGA', 'LGA_Code']).size().reset_index(name='Number of Schools')
     col1, col2, col3 = st.columns(3)
     
@@ -511,14 +520,17 @@ def display_results(generated_codes, state_name):
     with col3:
         st.metric("State", state_name)
     
-    st.subheader("Generated School Codes")
+    # Display data
+    st.subheader("📋 Generated School Codes")
     st.dataframe(df, use_container_width=True)
     
-    st.subheader("Download Results")
+    # Download options
+    st.subheader("📥 Download Results")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
+        # CSV Download
         csv = df.to_csv(index=False)
         st.download_button(
             label="Download as CSV",
@@ -528,6 +540,7 @@ def display_results(generated_codes, state_name):
         )
     
     with col2:
+        # Excel Download
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='School Codes')
@@ -542,6 +555,7 @@ def display_results(generated_codes, state_name):
         )
     
     with col3:
+        # Text file with codes only
         codes_only = "\n".join(df['School_Code'].tolist())
         st.download_button(
             label="Download Codes Only (TXT)",
@@ -569,6 +583,8 @@ def state_info_ui(generator):
                 st.subheader(f"{state_name} Information")
                 st.metric("State Code", state_code)
                 st.metric("Number of LGAs", len(lgas))
+                
+                st.info("💡 LGA codes follow official government numbering")
             
             with col2:
                 st.subheader("Local Government Areas")
