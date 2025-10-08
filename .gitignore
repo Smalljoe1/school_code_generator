@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+\.venv/
+school_app/  # local virtual environment that appears to be inside the repo
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# Sample data (exclude large or private files)
+sample_data/
