@@ -586,13 +586,38 @@ def about_ui():
     st.header("About Nigeria School Code Generator")
     
     st.markdown("""
-    This web application generates unique school codes for all Nigerian states and Local Government Areas (LGAs)
-    following the official format: SSLLXXXX
+    ## 🎯 Purpose
+    This web application generates unique school codes for all Nigerian states and Local Government Areas (LGAs) 
+    following the official format: `SSLLXXXX`
     
-    - SS: State code (2 digits)
-    - LL: LGA code (2 digits)
-    - XXXX: School serial number (4 digits)
+    - **SS**: State code (2 digits)
+    - **LL**: LGA code (2 digits) 
+    - **XXXX**: School serial number (4 digits)
+    
+    ## 📊 Coverage
+    - **36 States** + Federal Capital Territory (FCT)
+    - **774 Local Government Areas** nationwide
+    - **Official numbering** for all states and LGAs
+    
+    ## 🚀 Features
+    - Generate codes for specific LGAs or entire states
+    - Prevent duplicates by checking existing codes
+    - Multiple download formats (CSV, Excel, TXT)
+    - Official LGA codes and numbering
+    
+    ## 📝 Usage
+    1. Select a state and LGAs
+    2. Specify number of schools per LGA
+    3. Upload existing codes (optional, to avoid duplicates)
+    4. Generate and download results
+    
+    ## 🛠️ Technical Details
+    - Built with Streamlit
+    - Uses official Nigerian government LGA numbering
+    - Supports CSV, Excel, and text file formats
     """)
+    
+    st.info("💡 **Tip**: Use the 'State Information' section to view all LGAs and their official codes for any state.")
 
 if __name__ == "__main__":
     main()
