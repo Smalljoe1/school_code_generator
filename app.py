@@ -299,11 +299,11 @@ class SchoolCodeGenerator:
                 "Anka": "01", "Bakura": "02", "Birnin Magaji/Kiyaw": "03", "Bukkuyum": "04",
                 "Bungudu": "05", "Gummi": "06", "Gusau": "07", "Kaura Namoda": "08",
                 "Maradun": "09", "Maru": "10", "Shinkafi": "11", "Talata Mafara": "12",
-                "Chafe": "13", "Zurmi": "14"
+                "Tsafe": "13", "Zurmi": "14"
             },
             'fct': {
-                "Abaji": "01", "Bwari": "02", "Gwagwalada": "03", "Kuje": "04",
-                "Kwali": "05", "Municipal Area Council": "06"
+                "Abaji": "01", "Abuja Municipal Area Council": "02", "Bwari": "03", "Gwagwalada": "04", "Kuje": "05",
+                "Kwali": "06", 
             }
         }
     
@@ -398,7 +398,7 @@ class SchoolCodeGenerator:
             next_serial = lga_next_serials.get(lga_code, 1)
             
             for i in range(num_schools):
-                serial_number = str(next_serial + i).zfill(4)
+                serial_number = str(next_serial + i).zfill(6)
                 school_code = f"{state_code}{lga_code}{serial_number}"
                 generated_codes.append({
                     'State': state_name.title(),
@@ -604,11 +604,11 @@ def about_ui():
     st.markdown("""
     ## 🎯 Purpose
     This web application generates unique school codes for all Nigerian states and Local Government Areas (LGAs) 
-    following the official format: `SSLLXXXX`
+    following the official format: `SSLLXXXXXX`
     
     - **SS**: State code (2 digits)
     - **LL**: LGA code (2 digits) 
-    - **XXXX**: School serial number (4 digits)
+    - **XXXXXX**: School serial number (6 digits)
     
     ## 📊 Coverage
     - **36 States** + Federal Capital Territory (FCT)
