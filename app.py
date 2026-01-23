@@ -703,7 +703,7 @@ def process_school_list_ui(generator):
     )
     
     existing_codes_file = st.file_uploader(
-        "Upload Existing Codes (Optional)",
+        "Upload Existing School Codes (Optional)",
         type=['csv', 'xlsx', 'xls', 'txt']
     )
     
@@ -1086,7 +1086,7 @@ def about_ui():
     ### For Bulk Code Generation:
     1. Select a state and LGAs
     2. Specify number of schools per LGA
-    3. Upload existing codes (optional, to avoid duplicates)
+    3. Upload existing School codes (optional, to avoid duplicates)
     4. Generate and download results
     
     ## 🛠️ Technical Details
