@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import os
 from io import BytesIO
 
@@ -333,9 +334,9 @@ class SchoolCodeGenerator:
     def read_existing_codes(self, uploaded_file):
         try:
             if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
+                df = pd.read_csv(uploaded_file, dtype=str)  # Read all as string
             elif uploaded_file.name.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(uploaded_file)
+                df = pd.read_excel(uploaded_file, dtype=str)  # Read all as string
             else:
                 content = uploaded_file.getvalue().decode("utf-8")
                 codes = [line.strip() for line in content.split('\n') if line.strip()]
@@ -357,7 +358,7 @@ class SchoolCodeGenerator:
         
         for code in existing_codes:
             code_str = str(code).strip()
-            if len(code_str) == 8 and code_str.startswith(state_code):
+            if len(code_str) == 10 and code_str.startswith(state_code):
                 lga_code = code_str[2:4]
                 try:
                     serial = int(code_str[4:])
@@ -410,6 +411,194 @@ class SchoolCodeGenerator:
         
         return generated_codes
 
+    def analyze_uploaded_file(self, df):
+        """Analyze the uploaded school list file and return statistics"""
+        stats = {}
+        
+        # Basic statistics
+        stats['total_schools'] = len(df)
+        stats['total_columns'] = len(df.columns)
+        
+        # Column analysis
+        stats['columns'] = list(df.columns)
+        stats['missing_values'] = df.isnull().sum().to_dict()
+        stats['missing_values_total'] = df.isnull().sum().sum()
+        
+        # LGA analysis
+        if 'lgacode' in df.columns:
+            stats['unique_lgas'] = df['lgacode'].nunique()
+            stats['lga_distribution'] = df['lgacode'].value_counts().head(10).to_dict()
+        
+        # State analysis
+        if 'state' in df.columns:
+            stats['unique_states'] = df['state'].nunique()
+            stats['state_distribution'] = df['state'].value_counts().head(10).to_dict()
+        
+        # School code analysis if already exists
+        if 'school_code' in df.columns:
+            existing_codes = df['school_code'].dropna()
+            stats['existing_codes_count'] = len(existing_codes)
+            stats['invalid_codes'] = existing_codes[~existing_codes.astype(str).str.match(r'^\d{10}$')].tolist()
+            stats['invalid_codes_count'] = len(stats['invalid_codes'])
+        
+        return stats
+    
+    def check_for_duplicates(self, generated_codes, existing_codes):
+        """Check for duplicates between generated and existing codes"""
+        duplicates = []
+        duplicate_details = []
+        
+        if existing_codes:
+            existing_set = set([str(c).strip() for c in existing_codes if str(c).strip()])
+            generated_list = [str(c).strip() for c in generated_codes if str(c).strip()]
+            
+            for code in generated_list:
+                if code in existing_set:
+                    duplicates.append(code)
+                    # Try to find more details about the duplicate
+                    duplicate_details.append({
+                        'code': code,
+                        'type': 'Duplicate with existing code'
+                    })
+        
+        return duplicates, duplicate_details
+    
+    def process_school_list_file(self, uploaded_file, existing_codes_file=None):
+        try:
+            # Read the uploaded file
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file, dtype=str)
+            else:
+                df = pd.read_excel(uploaded_file, dtype=str)
+            
+            # Store original for statistics
+            original_df = df.copy()
+            
+            # Fill NaN values
+            df = df.fillna('')
+            
+            # Convert column names to lowercase for consistency
+            df.columns = [str(col).lower().strip() for col in df.columns]
+            
+            # Check for required columns
+            required_columns = ['state', 'lga', 'school_name', 'lgacode']
+            for col in required_columns:
+                if col not in df.columns:
+                    st.error(f"Missing required column: '{col}'")
+                    return None, None, None, None
+            
+            # Process lgacode - ensure it's 4 digits
+            df['lgacode'] = df['lgacode'].astype(str).str.strip()
+            df['lgacode'] = df['lgacode'].apply(lambda x: x.zfill(4) if x.isdigit() else x)
+            
+            # Validate lgacode format
+            invalid_mask = ~df['lgacode'].str.match(r'^\d{4}$')
+            if invalid_mask.any():
+                invalid_count = invalid_mask.sum()
+                st.error(f"Found {invalid_count} invalid lgacodes. Must be 4 digits.")
+                return None, None, None, None
+            
+            # Read existing codes
+            existing_codes = set()
+            existing_codes_list = []
+            if existing_codes_file:
+                existing_codes_list = self.read_existing_codes(existing_codes_file)
+                existing_codes = set([str(c).strip() for c in existing_codes_list if str(c).strip()])
+            
+            # Initialize school_code column
+            df['school_code'] = ''
+            
+            # Track processing statistics
+            processing_stats = {
+                'lga_stats': [],
+                'total_duplicates_avoided': 0,
+                'max_serial_per_lga': {},
+                'codes_generated': 0
+            }
+            
+            # Group by LGA and generate codes
+            for lgacode in df['lgacode'].unique():
+                if not lgacode:
+                    continue
+                
+                # Get indices for this LGA
+                lga_indices = df.index[df['lgacode'] == lgacode].tolist()
+                num_schools = len(lga_indices)
+                
+                # Get existing serials for this LGA
+                existing_serials = []
+                duplicate_codes_in_lga = []
+                for code in existing_codes:
+                    code_str = str(code).strip()
+                    # Check if code matches this LGA and is 10 digits
+                    if code_str.startswith(lgacode) and len(code_str) == 10:
+                        try:
+                            serial = int(code_str[4:])  # Extract the last 6 digits
+                            existing_serials.append(serial)
+                            duplicate_codes_in_lga.append(code_str)
+                        except:
+                            pass
+                
+                # Start from next available serial
+                start_serial = max(existing_serials) + 1 if existing_serials else 1
+                
+                # Generate codes for each school in this LGA
+                generated_codes_for_lga = []
+                for i, idx in enumerate(lga_indices):
+                    serial_num = str(start_serial + i).zfill(6)
+                    school_code = f"{lgacode}{serial_num}"
+                    df.at[idx, 'school_code'] = school_code
+                    generated_codes_for_lga.append(school_code)
+                
+                # Track stats for this LGA
+                lga_stats = {
+                    'lgacode': lgacode,
+                    'num_schools': num_schools,
+                    'start_serial': start_serial,
+                    'end_serial': start_serial + num_schools - 1,
+                    'existing_serials_count': len(existing_serials),
+                    'duplicate_codes_avoided': duplicate_codes_in_lga,
+                    'generated_codes': generated_codes_for_lga[:5]  # First 5 for preview
+                }
+                processing_stats['lga_stats'].append(lga_stats)
+                processing_stats['total_duplicates_avoided'] += len(duplicate_codes_in_lga)
+                processing_stats['max_serial_per_lga'][lgacode] = start_serial + num_schools - 1
+                processing_stats['codes_generated'] += num_schools
+            
+            # Check for any duplicates that might have been created
+            generated_codes_list = [code for code in df['school_code'].tolist() if str(code).strip() != '']
+            duplicates, duplicate_details = self.check_for_duplicates(generated_codes_list, existing_codes_list)
+            
+            # Update processing stats with duplicate info
+            processing_stats['final_duplicates'] = duplicates
+            processing_stats['duplicate_details'] = duplicate_details
+            processing_stats['duplicate_count'] = len(duplicates)
+            
+            # Analyze original file for statistics
+            original_stats = self.analyze_uploaded_file(original_df)
+            
+            # Ensure all expected columns exist
+            expected_columns = [
+                'school_code', 'lgacode', 'category', 'state', 'lga', 'ward', 
+                'school_name', 'prefix', 'town', 'location', 'school_level', 
+                'year', 'set_name'
+            ]
+            
+            for col in expected_columns:
+                if col not in df.columns:
+                    df[col] = ''
+            
+            # Reorder columns
+            df = df[expected_columns]
+            
+            return df, original_stats, processing_stats, duplicates
+            
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+            return None, None, None, None
+
 def main():
     st.set_page_config(
         page_title="Nigeria School Code Generator",
@@ -425,10 +614,12 @@ def main():
     
     # Sidebar for navigation
     st.sidebar.title("Navigation")
-    app_mode = st.sidebar.radio("Choose Mode", ["Generate Codes", "State Information", "About"])
+    app_mode = st.sidebar.radio("Choose Mode", ["Generate Codes", "Process School List", "State Information", "About"])
     
     if app_mode == "Generate Codes":
         generate_codes_ui(generator)
+    elif app_mode == "Process School List":
+        process_school_list_ui(generator)
     elif app_mode == "State Information":
         state_info_ui(generator)
     else:
@@ -501,6 +692,252 @@ def generate_codes_ui(generator):
             display_results(generated_codes, state_name)
         else:
             st.error("No codes were generated. Please check your inputs.")
+
+def process_school_list_ui(generator):
+    st.header("📋 Process School List")
+    
+    # File upload
+    school_list_file = st.file_uploader(
+        "Upload School List (Excel/CSV)",
+        type=['csv', 'xlsx', 'xls']
+    )
+    
+    existing_codes_file = st.file_uploader(
+        "Upload Existing Codes (Optional)",
+        type=['csv', 'xlsx', 'xls', 'txt']
+    )
+    
+    if st.button("Generate School Codes", type="primary"):
+        if not school_list_file:
+            st.error("Please upload a school list file")
+            return
+        
+        with st.spinner("Processing school list and generating codes..."):
+            result_df, original_stats, processing_stats, duplicates = generator.process_school_list_file(
+                uploaded_file=school_list_file,
+                existing_codes_file=existing_codes_file
+            )
+        
+        if result_df is not None:
+            display_school_list_results(
+                result_df, 
+                school_list_file, 
+                original_stats, 
+                processing_stats, 
+                duplicates
+            )
+
+def display_school_list_results(result_df, original_file, original_stats, processing_stats, duplicates):
+    st.success(f"✅ Successfully processed {len(result_df)} schools!")
+    
+    # Create tabs for different sections
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Overview", 
+        "📈 Uploaded File Stats", 
+        "⚙️ Processing Stats", 
+        "🔍 Duplicate Check", 
+        "📥 Download"
+    ])
+    
+    with tab1:
+        # Overview statistics
+        st.subheader("📊 Overview Statistics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_schools = len(result_df)
+            st.metric("Total Schools", total_schools)
+        
+        with col2:
+            generated_codes = result_df['school_code'].apply(lambda x: str(x).strip() != '').sum()
+            st.metric("Generated Codes", generated_codes)
+        
+        with col3:
+            unique_lgas = result_df['lgacode'].nunique()
+            st.metric("Unique LGAs", unique_lgas)
+        
+        with col4:
+            unique_states = result_df['state'].nunique()
+            st.metric("States", unique_states)
+        
+        # Check if school codes were generated
+        if generated_codes == 0:
+            st.error("❌ CRITICAL ISSUE: No school codes were generated!")
+            st.info("Please check the debug information above to identify the issue.")
+        elif generated_codes < total_schools:
+            st.warning(f"⚠️ {total_schools - generated_codes} schools did not receive codes!")
+        else:
+            st.success(f"✅ Successfully generated codes for all {generated_codes} schools")
+        
+        # Preview of results
+        st.subheader("📋 Preview of Generated Codes")
+        
+        # Show first 10 rows with key columns
+        preview_cols = ['school_code', 'lgacode', 'state', 'lga', 'school_name']
+        if 'ward' in result_df.columns:
+            preview_cols.append('ward')
+        if 'category' in result_df.columns:
+            preview_cols.append('category')
+        
+        preview_df = result_df[preview_cols].head(10)
+        st.dataframe(preview_df, use_container_width=True)
+    
+    with tab2:
+        # Uploaded file statistics
+        st.subheader("📈 Uploaded File Statistics")
+        
+        if original_stats:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Schools", original_stats.get('total_schools', 0))
+                st.metric("Total Columns", original_stats.get('total_columns', 0))
+            
+            with col2:
+                if 'unique_lgas' in original_stats:
+                    st.metric("Unique LGAs", original_stats['unique_lgas'])
+                if 'unique_states' in original_stats:
+                    st.metric("Unique States", original_stats['unique_states'])
+            
+            with col3:
+                st.metric("Missing Values", original_stats.get('missing_values_total', 0))
+                if 'existing_codes_count' in original_stats:
+                    st.metric("Existing Codes", original_stats['existing_codes_count'])
+            
+            # Show column information
+            st.subheader("📋 File Columns")
+            st.write(f"Total columns: {len(original_stats.get('columns', []))}")
+            st.write(f"Columns: {', '.join(original_stats.get('columns', []))}")
+            
+            # Show top LGAs
+            if 'lga_distribution' in original_stats and original_stats['lga_distribution']:
+                st.subheader("🏙️ Top LGAs in Uploaded File")
+                lga_df = pd.DataFrame(list(original_stats['lga_distribution'].items()), 
+                                    columns=['LGA Code', 'Number of Schools'])
+                st.dataframe(lga_df, use_container_width=True)
+        
+        else:
+            st.info("No statistics available for the uploaded file.")
+    
+    with tab3:
+        # Processing statistics
+        st.subheader("⚙️ Processing Statistics")
+        
+        if processing_stats:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Codes Generated", processing_stats.get('codes_generated', 0))
+                st.metric("Duplicates Avoided", processing_stats.get('total_duplicates_avoided', 0))
+            
+            with col2:
+                st.metric("LGAs Processed", len(processing_stats.get('lga_stats', [])))
+            
+            with col3:
+                if duplicates:
+                    st.metric("Final Duplicates Found", len(duplicates))
+                else:
+                    st.metric("Final Duplicates Found", 0)
+            
+            # Show LGA processing details
+            if processing_stats.get('lga_stats'):
+                st.subheader("🏙️ LGA Processing Details")
+                lga_stats_df = pd.DataFrame(processing_stats['lga_stats'])
+                st.dataframe(lga_stats_df[['lgacode', 'num_schools', 'start_serial', 'end_serial', 'existing_serials_count']], 
+                           use_container_width=True)
+            
+            # Show serial number ranges
+            if processing_stats.get('max_serial_per_lga'):
+                st.subheader("🔢 Serial Number Ranges per LGA")
+                serial_df = pd.DataFrame(list(processing_stats['max_serial_per_lga'].items()), 
+                                       columns=['LGA Code', 'Max Serial'])
+                st.dataframe(serial_df.sort_values('Max Serial', ascending=False), use_container_width=True)
+    
+    with tab4:
+        # Duplicate check results
+        st.subheader("🔍 Duplicate Code Analysis")
+        
+        if duplicates:
+            st.error(f"❌ {len(duplicates)} DUPLICATE CODES FOUND!")
+            st.write("These generated codes already exist in the uploaded existing codes file:")
+            
+            # Show duplicates in a table
+            dup_df = result_df[result_df['school_code'].isin(duplicates)]
+            if not dup_df.empty:
+                st.dataframe(dup_df[['school_code', 'lgacode', 'state', 'lga', 'school_name']].head(10))
+                
+                if len(duplicates) > 10:
+                    st.write(f"... and {len(duplicates) - 10} more duplicates")
+            
+            # Show detailed duplicate information
+            if processing_stats and 'duplicate_details' in processing_stats:
+                st.subheader("📋 Duplicate Details")
+                dup_details_df = pd.DataFrame(processing_stats['duplicate_details'])
+                st.dataframe(dup_details_df, use_container_width=True)
+        else:
+            st.success("✅ No duplicate codes found!")
+            
+            if processing_stats and processing_stats.get('total_duplicates_avoided', 0) > 0:
+                st.info(f"⚠️ Note: {processing_stats['total_duplicates_avoided']} potential duplicates were avoided during processing by skipping existing serial numbers.")
+    
+    with tab5:
+        # Download options
+        st.subheader("📥 Download Results")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # CSV Download
+            csv_data = result_df.to_csv(index=False)
+            original_name = original_file.name.split('.')[0]
+            st.download_button(
+                label="📄 Download as CSV",
+                data=csv_data,
+                file_name=f"school_codes_{original_name}.csv",
+                mime="text/csv",
+                type="primary",
+                use_container_width=True
+            )
+        
+        with col2:
+            # Excel Download
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                result_df.to_excel(writer, index=False, sheet_name='School Codes')
+                
+                # Add summary sheet
+                summary_df = result_df.groupby(['state', 'lga', 'lgacode']).size().reset_index(name='Number of Schools')
+                summary_df.to_excel(writer, index=False, sheet_name='Summary')
+            
+            excel_data = output.getvalue()
+            
+            st.download_button(
+                label="📊 Download as Excel",
+                data=excel_data,
+                file_name=f"school_codes_{original_name}.xlsx",
+                mime="application/vnd.ms-excel",
+                type="primary",
+                use_container_width=True
+            )
+        
+        # Debug information
+        with st.expander("🔍 Debug Information"):
+            st.write("**DataFrame Info:**")
+            st.write(f"Shape: {result_df.shape}")
+            st.write(f"Columns: {list(result_df.columns)}")
+            
+            st.write("**Sample of first 5 rows (all columns):**")
+            st.dataframe(result_df.head(5), use_container_width=True)
+            
+            # Check for empty school codes
+            empty_codes = result_df['school_code'].apply(lambda x: str(x).strip() == '').sum()
+            st.write(f"Empty school codes: {empty_codes}")
+            
+            if empty_codes > 0:
+                st.write("**Rows with empty school codes:**")
+                empty_rows = result_df[result_df['school_code'].apply(lambda x: str(x).strip() == '')].head(5)
+                st.dataframe(empty_rows)
 
 def display_results(generated_codes, state_name):
     st.success(f"✅ Successfully generated {len(generated_codes)} school codes for {state_name}!")
@@ -616,12 +1053,37 @@ def about_ui():
     - **Official numbering** for all states and LGAs
     
     ## 🚀 Features
+    ### 1. Generate Codes
     - Generate codes for specific LGAs or entire states
     - Prevent duplicates by checking existing codes
     - Multiple download formats (CSV, Excel, TXT)
-    - Official LGA codes and numbering
+    
+    ### 2. Process School List (NEW)
+    - Upload Excel/CSV files with school lists
+    - **Automatic handling of leading zeros** in lgacode
+    - **Case-insensitive column names** (State, state, STATE all work)
+    - Assign unique school codes to each school
+    - Group by LGA and assign sequential serial numbers
+    - Preserve all existing data in the file
+    - Download the updated file with generated codes
+    - **Comprehensive statistics** on uploaded files
+    - **Duplicate detection** and reporting
+    
+    ## ⚠️ Important Note for School List Processing
+    When uploading Excel files with lgacode column:
+    - Excel may drop leading zeros from numbers (e.g., `0101` becomes `101`)
+    - The tool automatically pads numbers to 4 digits with leading zeros
+    - Examples: `101` → `0101`, `201` → `0201`, `2401` → `2401`
     
     ## 📝 Usage
+    ### For School List Processing:
+    1. Prepare Excel/CSV file with required columns
+    2. Ensure 'lgacode' column contains SS+LL format
+    3. Upload the file
+    4. View comprehensive statistics and duplicate reports
+    5. Generate and download results
+    
+    ### For Bulk Code Generation:
     1. Select a state and LGAs
     2. Specify number of schools per LGA
     3. Upload existing codes (optional, to avoid duplicates)
@@ -631,6 +1093,9 @@ def about_ui():
     - Built with Streamlit
     - Uses official Nigerian government LGA numbering
     - Supports CSV, Excel, and text file formats
+    - Handles Excel's automatic number formatting issues
+    - Case-insensitive column name matching
+    - Comprehensive duplicate detection and reporting
     """)
     
     st.info("💡 **Tip**: Use the 'State Information' section to view all LGAs and their official codes for any state.")
