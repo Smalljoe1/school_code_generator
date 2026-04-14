@@ -26,3 +26,6 @@ Thumbs.db
 
 # Sample data (exclude large or private files)
 sample_data/
+
+# OU reference file — private operational data, not for public distribution
+State_LGA_Wards_OUs_List.csv
