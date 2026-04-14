@@ -518,14 +518,17 @@ class SchoolCodeGenerator:
     def _get_ou_reference_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.ou_reference_filename)
 
-    def load_ou_reference(self, reference_path=None):
-        reference_file_path = reference_path or self._get_ou_reference_path()
-        if not os.path.exists(reference_file_path):
-            raise FileNotFoundError(
-                f"OU reference file not found: {reference_file_path}. Place {self.ou_reference_filename} beside app.py."
-            )
-
-        reference_df = self._read_table_file(reference_file_path).fillna('')
+    def load_ou_reference(self, reference_path=None, reference_file=None):
+        if reference_file is not None:
+            reference_df = self._read_table_file(reference_file).fillna('')
+            reference_file_path = '<uploaded>'
+        else:
+            reference_file_path = reference_path or self._get_ou_reference_path()
+            if not os.path.exists(reference_file_path):
+                raise FileNotFoundError(
+                    f"OU reference file not found: {reference_file_path}. Place {self.ou_reference_filename} beside app.py."
+                )
+            reference_df = self._read_table_file(reference_file_path).fillna('')
         reference_df.columns = [str(col).lower().strip() for col in reference_df.columns]
 
         required_columns = [
@@ -719,7 +722,7 @@ class SchoolCodeGenerator:
 
         return max_serial_by_lga, invalid_code_rows
 
-    def process_new_school_intake(self, uploaded_file, base_url, username, password, reference_path=None):
+    def process_new_school_intake(self, uploaded_file, base_url, username, password, reference_path=None, reference_file=None):
         try:
             df = self._read_table_file(uploaded_file).fillna('')
             original_df = df.copy()
@@ -769,7 +772,7 @@ class SchoolCodeGenerator:
             df.loc[opening_date_valid_mask, 'openingdate'] = opening_date_parsed[opening_date_valid_mask].dt.strftime('%Y-%m-%d')
             df.loc[opening_date_missing_mask | opening_date_invalid_mask, 'openingdate'] = '2024-01-01'
 
-            reference_df, reference_file_path = self.load_ou_reference(reference_path=reference_path)
+            reference_df, reference_file_path = self.load_ou_reference(reference_path=reference_path, reference_file=reference_file)
             lga_reference_df = reference_df[
                 ['state (level2)', 'lga (level3)', 'lgauid', 'lgacode (ssll)', 'lgaparentuid', 'state_key', 'lga_key']
             ].drop_duplicates().reset_index(drop=True)
@@ -2198,11 +2201,32 @@ def new_school_intake_ui(generator):
     )
 
     reference_path = generator._get_ou_reference_path()
-    if os.path.exists(reference_path):
+    ref_file_available = os.path.exists(reference_path)
+    reference_file_upload = None
+    if ref_file_available:
         st.caption(f"Using OU reference file: {generator.ou_reference_filename}")
     else:
-        st.error(f"Reference file not found: {generator.ou_reference_filename}")
-        return
+        st.warning(
+            f"`{generator.ou_reference_filename}` was not found on this server. "
+            "Please upload it below to continue."
+        )
+        uploaded_ref = st.file_uploader(
+            f"Upload {generator.ou_reference_filename}",
+            type=['csv'],
+            key='ou_reference_file_upload',
+            help="This file contains the State/LGA/Ward OU reference data. It is NOT stored in the repository."
+        )
+        if uploaded_ref is not None:
+            st.session_state['ou_reference_file_bytes'] = uploaded_ref.getvalue()
+            st.session_state['ou_reference_file_name'] = uploaded_ref.name
+        if 'ou_reference_file_bytes' in st.session_state:
+            import io
+            reference_file_upload = io.BytesIO(st.session_state['ou_reference_file_bytes'])
+            reference_file_upload.name = st.session_state.get('ou_reference_file_name', generator.ou_reference_filename)
+            st.success(f"Reference file loaded: {st.session_state.get('ou_reference_file_name', generator.ou_reference_filename)}")
+        else:
+            st.info("Upload the reference CSV above to enable processing.")
+            return
 
     col1, col2 = st.columns(2)
     with col1:
@@ -2254,12 +2278,24 @@ def new_school_intake_ui(generator):
             return
 
         with st.spinner("Resolving schools and fetching current DHIS2 codes..."):
+            import io
+            ref_kwarg = {}
+            if not ref_file_available:
+                if 'ou_reference_file_bytes' in st.session_state:
+                    buf = io.BytesIO(st.session_state['ou_reference_file_bytes'])
+                    buf.name = st.session_state.get('ou_reference_file_name', generator.ou_reference_filename)
+                    ref_kwarg['reference_file'] = buf
+                else:
+                    st.error("Please upload the OU reference CSV before processing.")
+                    return
+            else:
+                ref_kwarg['reference_path'] = reference_path
             result_df, original_stats, processing_stats = generator.process_new_school_intake(
                 uploaded_file=intake_file,
                 base_url=base_url,
                 username=username,
                 password=password,
-                reference_path=reference_path
+                **ref_kwarg
             )
 
         if result_df is not None:
