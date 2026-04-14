@@ -9,6 +9,7 @@ from io import BytesIO
 class SchoolCodeGenerator:
     def __init__(self):
         self.ou_reference_filename = "State_LGA_Wards_OUs_List.csv"
+        self.ou_reference_alias_filename = "ou_index_2026.csv"
         self.state_codes = {
                 'abia': '01', 'adamawa': '02', 'akwa ibom': '03', 'anambra': '04',
                 'bauchi': '05', 'bayelsa': '06', 'benue': '07', 'borno': '08',
@@ -516,7 +517,46 @@ class SchoolCodeGenerator:
         return ''
 
     def _get_ou_reference_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.ou_reference_filename)
+        for candidate in self._get_ou_reference_candidate_paths():
+            if os.path.exists(candidate):
+                return candidate
+        return self._get_ou_reference_candidate_paths()[0]
+
+    def _get_ou_reference_candidate_paths(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return [
+            os.path.join(base_dir, "school_app", "etc", self.ou_reference_alias_filename),
+            os.path.join(base_dir, self.ou_reference_alias_filename),
+            os.path.join(base_dir, self.ou_reference_filename),
+            os.path.join(base_dir, "school_app", "etc", self.ou_reference_filename),
+        ]
+
+    def _get_secret_or_env(self, key):
+        value = ""
+        try:
+            value = str(st.secrets.get(key, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            return value
+        return str(os.getenv(key, "") or "").strip()
+
+    def fetch_ou_reference_from_remote(self):
+        reference_url = self._get_secret_or_env("OU_REFERENCE_URL")
+        if not reference_url:
+            return None, ""
+
+        headers = {}
+        bearer_token = self._get_secret_or_env("OU_REFERENCE_BEARER_TOKEN")
+        if bearer_token:
+            headers["Authorization"] = f"Bearer {bearer_token}"
+
+        response = requests.get(reference_url, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        buffer = BytesIO(response.content)
+        buffer.name = self.ou_reference_alias_filename
+        return buffer, reference_url
 
     def load_ou_reference(self, reference_path=None, reference_file=None):
         if reference_file is not None:
@@ -526,7 +566,8 @@ class SchoolCodeGenerator:
             reference_file_path = reference_path or self._get_ou_reference_path()
             if not os.path.exists(reference_file_path):
                 raise FileNotFoundError(
-                    f"OU reference file not found: {reference_file_path}. Place {self.ou_reference_filename} beside app.py."
+                    f"OU reference file not found: {reference_file_path}. "
+                    f"Checked: {', '.join(self._get_ou_reference_candidate_paths())}"
                 )
             reference_df = self._read_table_file(reference_file_path).fillna('')
         reference_df.columns = [str(col).lower().strip() for col in reference_df.columns]
@@ -2202,30 +2243,30 @@ def new_school_intake_ui(generator):
 
     reference_path = generator._get_ou_reference_path()
     ref_file_available = os.path.exists(reference_path)
-    reference_file_upload = None
     if ref_file_available:
-        st.caption(f"Using OU reference file: {generator.ou_reference_filename}")
+        st.caption(f"Using OU reference file: {os.path.basename(reference_path)}")
     else:
-        st.warning(
-            f"`{generator.ou_reference_filename}` was not found on this server. "
-            "Please upload it below to continue."
-        )
-        uploaded_ref = st.file_uploader(
-            f"Upload {generator.ou_reference_filename}",
-            type=['csv'],
-            key='ou_reference_file_upload',
-            help="This file contains the State/LGA/Ward OU reference data. It is NOT stored in the repository."
-        )
-        if uploaded_ref is not None:
-            st.session_state['ou_reference_file_bytes'] = uploaded_ref.getvalue()
-            st.session_state['ou_reference_file_name'] = uploaded_ref.name
+        if 'ou_reference_file_bytes' not in st.session_state:
+            try:
+                remote_buffer, remote_source = generator.fetch_ou_reference_from_remote()
+                if remote_buffer is not None:
+                    st.session_state['ou_reference_file_bytes'] = remote_buffer.getvalue()
+                    st.session_state['ou_reference_file_name'] = getattr(remote_buffer, 'name', generator.ou_reference_alias_filename)
+                    st.session_state['ou_reference_source'] = remote_source
+            except Exception as exc:
+                st.session_state['ou_reference_remote_error'] = str(exc)
+
         if 'ou_reference_file_bytes' in st.session_state:
-            import io
-            reference_file_upload = io.BytesIO(st.session_state['ou_reference_file_bytes'])
-            reference_file_upload.name = st.session_state.get('ou_reference_file_name', generator.ou_reference_filename)
-            st.success(f"Reference file loaded: {st.session_state.get('ou_reference_file_name', generator.ou_reference_filename)}")
+            source_label = st.session_state.get('ou_reference_source', 'remote source')
+            st.caption(f"Using OU reference file from secure source: {source_label}")
         else:
-            st.info("Upload the reference CSV above to enable processing.")
+            st.error("OU reference file is not available on this server.")
+            st.info(
+                "Place the renamed reference CSV at school_app/etc/ou_index_2026.csv, "
+                "or set OU_REFERENCE_URL in Streamlit secrets/environment for automatic secure download."
+            )
+            if 'ou_reference_remote_error' in st.session_state:
+                st.caption(f"Remote fetch error: {st.session_state['ou_reference_remote_error']}")
             return
 
     col1, col2 = st.columns(2)
@@ -2278,15 +2319,14 @@ def new_school_intake_ui(generator):
             return
 
         with st.spinner("Resolving schools and fetching current DHIS2 codes..."):
-            import io
             ref_kwarg = {}
             if not ref_file_available:
                 if 'ou_reference_file_bytes' in st.session_state:
-                    buf = io.BytesIO(st.session_state['ou_reference_file_bytes'])
-                    buf.name = st.session_state.get('ou_reference_file_name', generator.ou_reference_filename)
+                    buf = BytesIO(st.session_state['ou_reference_file_bytes'])
+                    buf.name = st.session_state.get('ou_reference_file_name', generator.ou_reference_alias_filename)
                     ref_kwarg['reference_file'] = buf
                 else:
-                    st.error("Please upload the OU reference CSV before processing.")
+                    st.error("OU reference file is not available. Configure local file or OU_REFERENCE_URL.")
                     return
             else:
                 ref_kwarg['reference_path'] = reference_path
