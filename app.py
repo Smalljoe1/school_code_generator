@@ -1191,12 +1191,12 @@ class SchoolCodeGenerator:
                     username=username,
                     password=password,
                     endpoint='/organisationUnits',
-                    params={
-                        'fields': 'id,name,code',
-                        'filter': f'level:eq:5',
-                        'filter': f'path:like:{lgauid}',
-                        'paging': 'false'
-                    },
+                    params=[
+                        ('fields', 'id,name,code,parent[id]'),
+                        ('filter', 'level:eq:5'),
+                        ('filter', f'path:like:{lgauid}'),
+                        ('paging', 'false')
+                    ],
                     timeout=60
                 )
                 lga_children[lgauid] = resp.json().get('organisationUnits', [])
@@ -1243,14 +1243,21 @@ class SchoolCodeGenerator:
             except Exception:
                 return {'raw': response.text}
 
+        def _normalize_name(name_value):
+            return re.sub(r'\s+', ' ', str(name_value or '').strip().lower())
+
+        def _clean_dhis_uid(uid_value):
+            uid_text = str(uid_value or '').strip()
+            # DHIS2 UID format: 11 chars, starts with a letter.
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9]{10}', uid_text):
+                return uid_text
+            return ''
+
         def _fetch_existing_by_codes(codes, expected_name_by_code=None):
             if not codes:
                 return {}
 
             expected_name_by_code = expected_name_by_code or {}
-
-            def _normalize_name(name_value):
-                return re.sub(r'\s+', ' ', str(name_value or '').strip().lower())
 
             def _pick_better_match(current_ou, candidate_ou, expected_name):
                 if current_ou is None:
@@ -1319,6 +1326,65 @@ class SchoolCodeGenerator:
 
             return existing
 
+        def _fetch_existing_name_matches_by_parent(rows_for_lookup):
+            """
+            Guardrail lookup: find existing level-5 OUs under the same parent LGA by normalized school name.
+            Returns dict keyed by (parent_uid, normalized_name) => best matching OU.
+            """
+            if rows_for_lookup is None or len(rows_for_lookup) == 0:
+                return {}
+
+            existing_by_parent_name = {}
+            parent_uids = sorted({
+                _clean_dhis_uid(row.get('parentuid_for_create', ''))
+                for _, row in rows_for_lookup.iterrows()
+            })
+            parent_uids = [uid for uid in parent_uids if uid]
+
+            for parent_uid in parent_uids:
+                try:
+                    response = self._dhis_request(
+                        method='GET',
+                        base_url=base_url,
+                        username=username,
+                        password=password,
+                        endpoint='/organisationUnits',
+                        params=[
+                            ('fields', 'id,code,name,parent[id],openingDate'),
+                            ('filter', 'level:eq:5'),
+                            ('filter', f'path:like:{parent_uid}'),
+                            ('paging', 'false')
+                        ],
+                        timeout=60
+                    )
+                    ous = response.json().get('organisationUnits', [])
+                except Exception:
+                    ous = []
+
+                for ou in ous:
+                    existing_parent_uid = _clean_dhis_uid((((ou or {}).get('parent') or {}).get('id')))
+                    if existing_parent_uid != parent_uid:
+                        continue
+                    normalized_name = _normalize_name((ou or {}).get('name'))
+                    if not normalized_name:
+                        continue
+
+                    key = (parent_uid, normalized_name)
+                    current = existing_by_parent_name.get(key)
+                    if current is None:
+                        existing_by_parent_name[key] = ou
+                        continue
+
+                    # Prefer OU that already has a 10-digit code.
+                    current_code = str((current or {}).get('code') or '').strip()
+                    candidate_code = str((ou or {}).get('code') or '').strip()
+                    current_valid = bool(re.fullmatch(r'\d{10}', current_code))
+                    candidate_valid = bool(re.fullmatch(r'\d{10}', candidate_code))
+                    if candidate_valid and not current_valid:
+                        existing_by_parent_name[key] = ou
+
+            return existing_by_parent_name
+
         if intake_df is None or len(intake_df) == 0:
             return {'status': 'NO_DATA', 'message': 'No intake rows to publish', 'response': {}}
 
@@ -1368,6 +1434,17 @@ class SchoolCodeGenerator:
             lookup_warning = f"Pre-publish existing-code lookup failed and was skipped: {e}"
             existing_by_code = {}
 
+        # Extra guardrail: avoid creating duplicate schools with different codes
+        # by checking for existing OU with same normalized name under the same parent LGA.
+        existing_name_matches_by_parent = {}
+        try:
+            existing_name_matches_by_parent = _fetch_existing_name_matches_by_parent(rows_to_post)
+        except Exception as e:
+            if lookup_warning:
+                lookup_warning = f"{lookup_warning}; name-match lookup failed: {e}"
+            else:
+                lookup_warning = f"Pre-publish name-match lookup failed and was skipped: {e}"
+
         # Prefer UID-based import to match payload references (id/uid, parent.id).
         # If pre-lookup failed entirely, fall back to CODE strategy to avoid hard failures.
         metadata_identifier = 'UID' if not lookup_warning else 'CODE'
@@ -1378,13 +1455,6 @@ class SchoolCodeGenerator:
         create_count = 0
         update_count = 0
 
-        def _clean_dhis_uid(uid_value):
-            uid_text = str(uid_value or '').strip()
-            # DHIS2 UID format: 11 chars, starts with a letter.
-            if re.fullmatch(r'[A-Za-z][A-Za-z0-9]{10}', uid_text):
-                return uid_text
-            return ''
-
         for _, row in rows_to_post.iterrows():
             school_name = str(row.get('school_name', '') or '').strip()
             school_code = str(row.get('school_code', '') or '').strip()
@@ -1392,6 +1462,8 @@ class SchoolCodeGenerator:
             opening_date = str(row.get('openingdate', '') or '').strip() or '2024-01-01'
 
             existing = existing_by_code.get(school_code)
+            if not existing and parent_uid and school_name:
+                existing = existing_name_matches_by_parent.get((parent_uid, _normalize_name(school_name)))
             existing_parent_uid = _clean_dhis_uid((((existing or {}).get('parent') or {}).get('id')))
             resolved_parent_uid = parent_uid or existing_parent_uid
 
@@ -1457,7 +1529,7 @@ class SchoolCodeGenerator:
                 password=password,
                 endpoint='/metadata',
                 params={
-                    'importMode': 'COMMIT',
+                    'importMode': 'VALIDATE' if dry_run else 'COMMIT',
                     'dryRun': 'true' if dry_run else 'false',
                     'importStrategy': 'CREATE_AND_UPDATE',
                     'identifier': metadata_identifier,
