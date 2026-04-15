@@ -2154,12 +2154,12 @@ class SchoolCodeGenerator:
 
 def main():
     st.set_page_config(
-        page_title="Nigeria School Code Generator",
+        page_title="DNEMIS School Code & Intake Publisher",
         page_icon="🏫",
         layout="wide"
     )
     
-    st.title("🏫 Nigeria School Code Generator")
+    st.title("🏫 DNEMIS School Code & Intake Publisher")
     st.markdown("Generate unique school codes for all Nigerian states and LGAs")
     
     # Initialize generator
@@ -3264,7 +3264,7 @@ def state_info_ui(generator):
             st.warning(f"No LGA data available for {state_name}")
 
 def about_ui():
-    st.header("About Nigeria School Code Generator")
+    st.header("About DNEMIS School Code & Intake Publisher")
 
     st.markdown("""
     ## 🎯 Purpose
