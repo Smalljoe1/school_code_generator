@@ -4,6 +4,7 @@ import numpy as np
 import os
 import re
 import requests
+import hashlib
 from io import BytesIO
 from difflib import SequenceMatcher
 
@@ -1236,7 +1237,7 @@ class SchoolCodeGenerator:
 
         return matches
 
-    def post_new_schools_to_dhis2(self, base_url, username, password, intake_df, dry_run=False):
+    def post_new_schools_to_dhis2(self, base_url, username, password, intake_df, dry_run=False, batch_size=100, duplicate_matches=None):
         def _safe_response_payload(response):
             try:
                 return response.json()
@@ -1279,7 +1280,7 @@ class SchoolCodeGenerator:
 
             existing = {}
             code_list = sorted(set(codes))
-            chunk_size = 25
+            chunk_size = 100
             for start in range(0, len(code_list), chunk_size):
                 chunk = code_list[start:start + chunk_size]
                 chunk_text = ','.join(chunk)
@@ -1325,6 +1326,39 @@ class SchoolCodeGenerator:
                             existing[code] = _pick_better_match(existing.get(code), ou, expected_name)
 
             return existing
+
+        def _build_existing_name_matches_from_duplicate_results(duplicate_rows):
+            existing_by_lga_name = {}
+            if not duplicate_rows:
+                return existing_by_lga_name
+
+            for item in duplicate_rows:
+                lgauid = _clean_dhis_uid((item or {}).get('lgauid'))
+                incoming_school_name = _normalize_name((item or {}).get('incoming_school_name'))
+                matched_uid = str((item or {}).get('matched_dhis2_uid') or '').strip()
+                matched_name = str((item or {}).get('matched_dhis2_name') or '').strip()
+                matched_code = str((item or {}).get('matched_dhis2_code') or '').strip()
+                if not lgauid or not incoming_school_name or not matched_uid:
+                    continue
+
+                key = (lgauid, incoming_school_name)
+                current = existing_by_lga_name.get(key)
+                candidate = {
+                    'id': matched_uid,
+                    'code': matched_code,
+                    'name': matched_name
+                }
+                if current is None:
+                    existing_by_lga_name[key] = candidate
+                    continue
+
+                current_match_type = str((current or {}).get('match_type') or '').upper()
+                candidate_match_type = str((item or {}).get('match_type') or '').upper()
+                if current_match_type != 'EXACT' and candidate_match_type == 'EXACT':
+                    candidate['match_type'] = candidate_match_type
+                    existing_by_lga_name[key] = candidate
+
+            return existing_by_lga_name
 
         def _fetch_existing_name_matches_by_parent(rows_for_lookup):
             """
@@ -1437,13 +1471,15 @@ class SchoolCodeGenerator:
         # Extra guardrail: avoid creating duplicate schools with different codes
         # by checking for existing OU with same normalized name under the same parent LGA.
         existing_name_matches_by_parent = {}
-        try:
-            existing_name_matches_by_parent = _fetch_existing_name_matches_by_parent(rows_to_post)
-        except Exception as e:
-            if lookup_warning:
-                lookup_warning = f"{lookup_warning}; name-match lookup failed: {e}"
-            else:
-                lookup_warning = f"Pre-publish name-match lookup failed and was skipped: {e}"
+        existing_name_matches_by_lga = _build_existing_name_matches_from_duplicate_results(duplicate_matches)
+        if not existing_name_matches_by_lga:
+            try:
+                existing_name_matches_by_parent = _fetch_existing_name_matches_by_parent(rows_to_post)
+            except Exception as e:
+                if lookup_warning:
+                    lookup_warning = f"{lookup_warning}; name-match lookup failed: {e}"
+                else:
+                    lookup_warning = f"Pre-publish name-match lookup failed and was skipped: {e}"
 
         # Prefer UID-based import to match payload references (id/uid, parent.id).
         # If pre-lookup failed entirely, fall back to CODE strategy to avoid hard failures.
@@ -1454,16 +1490,20 @@ class SchoolCodeGenerator:
         seen_codes = set()
         create_count = 0
         update_count = 0
+        preexisting_uid_by_incoming_code = {}
 
         for _, row in rows_to_post.iterrows():
             school_name = str(row.get('school_name', '') or '').strip()
             school_code = str(row.get('school_code', '') or '').strip()
+            lga_uid = _clean_dhis_uid(row.get('lgauid', ''))
             parent_uid = _clean_dhis_uid(row.get('parentuid_for_create', ''))
             opening_date = str(row.get('openingdate', '') or '').strip() or '2024-01-01'
 
             existing = existing_by_code.get(school_code)
             if not existing and parent_uid and school_name:
                 existing = existing_name_matches_by_parent.get((parent_uid, _normalize_name(school_name)))
+            if not existing and lga_uid and school_name:
+                existing = existing_name_matches_by_lga.get((lga_uid, _normalize_name(school_name)))
             existing_parent_uid = _clean_dhis_uid((((existing or {}).get('parent') or {}).get('id')))
             resolved_parent_uid = parent_uid or existing_parent_uid
 
@@ -1508,6 +1548,7 @@ class SchoolCodeGenerator:
                 if existing_uid:
                     payload_row['id'] = existing_uid
                     payload_row['uid'] = existing_uid
+                    preexisting_uid_by_incoming_code[school_code] = existing_uid
                 update_count += 1
             else:
                 create_count += 1
@@ -1521,89 +1562,124 @@ class SchoolCodeGenerator:
                 'response': {'skipped': skipped_rows}
             }
 
-        try:
-            response = self._dhis_request(
-                method='POST',
-                base_url=base_url,
-                username=username,
-                password=password,
-                endpoint='/metadata',
-                params={
-                    'importMode': 'VALIDATE' if dry_run else 'COMMIT',
-                    'dryRun': 'true' if dry_run else 'false',
-                    'importStrategy': 'CREATE_AND_UPDATE',
-                    'identifier': metadata_identifier,
-                    'atomicMode': 'NONE'
-                },
-                json_data={'organisationUnits': payload_rows},
-                timeout=180
-            )
-            dhis2_payload = _safe_response_payload(response)
-        except requests.HTTPError as e:
-            http_response = getattr(e, 'response', None)
-            dhis2_payload = _safe_response_payload(http_response) if http_response is not None else {'error': str(e)}
+        # Submit in batches to reduce request size and lower reconnect risk on hosted runtime.
+        batch_size_value = max(int(batch_size or 100), 1)
+        aggregate_stats = {'created': 0, 'updated': 0, 'deleted': 0, 'ignored': 0, 'total': 0}
+        chunk_summaries = []
+        warning_seen = False
 
-            import_report = (dhis2_payload or {}).get('response', {})
-            stats = (import_report or {}).get('stats', {})
-            created = int(stats.get('created', 0) or 0)
-            updated = int(stats.get('updated', 0) or 0)
-            deleted = int(stats.get('deleted', 0) or 0)
-            ignored = int(stats.get('ignored', 0) or 0)
-            total = int(stats.get('total', 0) or 0)
-
-            # Some DHIS2 instances return HTTP 409 with status WARNING even when rows were applied.
-            warning_but_applied = total > 0 and ignored == 0 and (created + updated + deleted) == total
-            if not warning_but_applied:
-                return {
-                    'status': 'FAILED',
-                    'message': (
-                        'DNEMIS rejected part or all of the upsert request. '
-                        'Review response.details for conflicts (409).'
-                    ),
-                    'response': {
-                        'dhis2': dhis2_payload,
-                        'prepared': len(payload_rows),
-                        'to_create': create_count,
-                        'to_update': update_count,
-                        'skipped': skipped_rows,
-                        'http_error': str(e),
-                        'lookup_warning': lookup_warning
-                    }
-                }
-
-        # Seed uid_by_code with pre-lookup UIDs for already-existing schools.
-        # These are the canonical DHIS2 UIDs and never change on an in-place update.
+        # Seed with known pre-existing UID matches first.
         uid_by_code = {}
-
-        # Highest-confidence mapping: DHIS2 import report objectReports are index-aligned
-        # with request payload order and include the actual OU UID affected.
-        object_reports = ((dhis2_payload or {}).get('response', {}) or {}).get('objectReports', [])
-        for object_report in object_reports:
-            try:
-                index_value = int((object_report or {}).get('index'))
-            except Exception:
-                continue
-            if index_value < 0 or index_value >= len(payload_rows):
-                continue
-            code_at_index = str((payload_rows[index_value] or {}).get('code') or '').strip()
-            uid_value = str((object_report or {}).get('uid') or '').strip()
-            if code_at_index and uid_value:
-                uid_by_code[code_at_index] = uid_value
-
-        # Pre-lookup UIDs are canonical for known existing schools; only use when objectReports
-        # did not provide the mapping for that code.
+        uid_by_code.update(preexisting_uid_by_incoming_code)
         for _code, _ou in existing_by_code.items():
-            if _code in uid_by_code:
-                continue
             _ou_id = str((_ou or {}).get('id') or '').strip()
-            if _ou_id:
+            if _code and _ou_id:
                 uid_by_code[_code] = _ou_id
+
+        for start_index in range(0, len(payload_rows), batch_size_value):
+            chunk_payload_rows = payload_rows[start_index:start_index + batch_size_value]
+            chunk_number = (start_index // batch_size_value) + 1
+
+            try:
+                response = self._dhis_request(
+                    method='POST',
+                    base_url=base_url,
+                    username=username,
+                    password=password,
+                    endpoint='/metadata',
+                    params={
+                        'importMode': 'VALIDATE' if dry_run else 'COMMIT',
+                        'dryRun': 'true' if dry_run else 'false',
+                        'importStrategy': 'CREATE_AND_UPDATE',
+                        'identifier': metadata_identifier,
+                        'atomicMode': 'NONE'
+                    },
+                    json_data={'organisationUnits': chunk_payload_rows},
+                    timeout=180
+                )
+                chunk_dhis2_payload = _safe_response_payload(response)
+            except requests.HTTPError as e:
+                http_response = getattr(e, 'response', None)
+                chunk_dhis2_payload = _safe_response_payload(http_response) if http_response is not None else {'error': str(e)}
+
+                import_report = (chunk_dhis2_payload or {}).get('response', {})
+                stats = (import_report or {}).get('stats', {})
+                created = int(stats.get('created', 0) or 0)
+                updated = int(stats.get('updated', 0) or 0)
+                deleted = int(stats.get('deleted', 0) or 0)
+                ignored = int(stats.get('ignored', 0) or 0)
+                total = int(stats.get('total', 0) or 0)
+
+                # Some DHIS2 instances return HTTP 409 with status WARNING even when rows were applied.
+                warning_but_applied = total > 0 and ignored == 0 and (created + updated + deleted) == total
+                if not warning_but_applied:
+                    return {
+                        'status': 'FAILED',
+                        'message': (
+                            f'DNEMIS rejected chunk {chunk_number}. '
+                            'Review response.details for conflicts (409).'
+                        ),
+                        'response': {
+                            'prepared': len(payload_rows),
+                            'processed_before_failure': start_index,
+                            'failed_chunk': chunk_number,
+                            'chunk_size': len(chunk_payload_rows),
+                            'to_create': create_count,
+                            'to_update': update_count,
+                            'skipped': skipped_rows,
+                            'http_error': str(e),
+                            'lookup_warning': lookup_warning,
+                            'dhis2_error': chunk_dhis2_payload
+                        }
+                    }
+
+            import_report = (chunk_dhis2_payload or {}).get('response', {})
+            import_stats = (import_report or {}).get('stats', {})
+            chunk_status = str((chunk_dhis2_payload or {}).get('status', '')).upper() or 'OK'
+
+            chunk_created = int(import_stats.get('created', 0) or 0)
+            chunk_updated = int(import_stats.get('updated', 0) or 0)
+            chunk_deleted = int(import_stats.get('deleted', 0) or 0)
+            chunk_ignored = int(import_stats.get('ignored', 0) or 0)
+            chunk_total = int(import_stats.get('total', len(chunk_payload_rows)) or len(chunk_payload_rows))
+
+            aggregate_stats['created'] += chunk_created
+            aggregate_stats['updated'] += chunk_updated
+            aggregate_stats['deleted'] += chunk_deleted
+            aggregate_stats['ignored'] += chunk_ignored
+            aggregate_stats['total'] += chunk_total
+
+            if chunk_status == 'WARNING':
+                warning_seen = True
+
+            chunk_summaries.append({
+                'chunk': chunk_number,
+                'rows': len(chunk_payload_rows),
+                'status': chunk_status,
+                'created': chunk_created,
+                'updated': chunk_updated,
+                'ignored': chunk_ignored
+            })
+
+            # objectReports indexes are relative to this chunk payload.
+            object_reports = (import_report or {}).get('objectReports', [])
+            for object_report in object_reports:
+                try:
+                    index_value = int((object_report or {}).get('index'))
+                except Exception:
+                    continue
+                if index_value < 0 or index_value >= len(chunk_payload_rows):
+                    continue
+                code_at_index = str((chunk_payload_rows[index_value] or {}).get('code') or '').strip()
+                uid_value = str((object_report or {}).get('uid') or '').strip()
+                if code_at_index and uid_value:
+                    uid_by_code[code_at_index] = uid_value
 
         # Post-lookup only for newly created schools (not already in uid_by_code).
         new_school_codes = [
             item['code'] for item in payload_rows if item['code'] not in uid_by_code
         ]
-        if new_school_codes:
+        if new_school_codes and not dry_run:
             try:
                 post_lookup = _fetch_existing_by_codes(new_school_codes, expected_name_by_code=expected_name_by_code)
                 for _code, _ou in post_lookup.items():
@@ -1613,26 +1689,22 @@ class SchoolCodeGenerator:
             except Exception:
                 pass
 
-        is_warning = str((dhis2_payload or {}).get('status', '')).upper() == 'WARNING'
-        final_status = 'DRY_RUN' if dry_run else ('POSTED_WITH_WARNING' if is_warning else 'POSTED')
+        final_status = 'DRY_RUN' if dry_run else ('POSTED_WITH_WARNING' if warning_seen else 'POSTED')
         final_message = (
             f"Prepared {len(payload_rows)} OU upserts ({create_count} create, {update_count} update) in dry run."
             if dry_run else
             f"Submitted {len(payload_rows)} OU upserts to DHIS2 ({create_count} create, {update_count} update)."
         )
-        if is_warning and not dry_run:
+        if warning_seen and not dry_run:
             final_message = f"{final_message} DNEMIS returned WARNING (check import report details)."
 
-        import_report = (dhis2_payload or {}).get('response', {})
-        import_stats = (import_report or {}).get('stats', {})
-        actual_created = int(import_stats.get('created', create_count) or 0)
-        actual_updated = int(import_stats.get('updated', update_count) or 0)
+        actual_created = int(aggregate_stats.get('created', 0) or 0)
+        actual_updated = int(aggregate_stats.get('updated', 0) or 0)
 
         return {
             'status': final_status,
             'message': final_message,
             'response': {
-                'dhis2': dhis2_payload,
                 'prepared': len(payload_rows),
                 'to_create': actual_created,
                 'to_update': actual_updated,
@@ -1641,6 +1713,10 @@ class SchoolCodeGenerator:
                 'uid_by_code': uid_by_code,
                 'metadata_identifier': metadata_identifier,
                 'lookup_warning': lookup_warning,
+                'batch_size': batch_size_value,
+                'chunk_count': len(chunk_summaries),
+                'chunk_summaries': chunk_summaries,
+                'import_stats': aggregate_stats,
                 'skipped': skipped_rows
             }
         }
@@ -2940,6 +3016,39 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         dry_run = st.checkbox("Dry run only (recommended first)", value=True, key='new_intake_publish_dry_run')
         confirm_publish = st.checkbox("I confirm I want to create or update these schools on DNEMIS", key='new_intake_publish_confirm')
 
+        if 'new_intake_publish_in_progress' not in st.session_state:
+            st.session_state['new_intake_publish_in_progress'] = False
+        if 'new_intake_publish_history' not in st.session_state:
+            st.session_state['new_intake_publish_history'] = {}
+
+        def _build_publish_request_id(df):
+            if df is None or len(df) == 0:
+                return ''
+            signature_parts = []
+            for _, row in df.iterrows():
+                school_code = re.sub(r'\D', '', str(row.get('school_code') or '').strip())
+                school_name = re.sub(r'\s+', ' ', str(row.get('school_name') or '').strip().lower())
+                parent_uid = re.sub(r'\s+', '', str(row.get('parentuid_for_create') or '').strip())
+                opening_date = re.sub(r'\s+', '', str(row.get('openingdate') or '').strip())
+                signature_parts.append(f"{school_code}|{parent_uid}|{opening_date}|{school_name}")
+
+            signature_parts.sort()
+            payload_text = (
+                f"{str(base_url or '').strip().lower()}|"
+                f"{str(username or '').strip().lower()}|"
+                f"dry_run={1 if dry_run else 0}|"
+                f"rows={len(signature_parts)}|"
+                f"{'||'.join(signature_parts)}"
+            )
+            return hashlib.sha256(payload_text.encode('utf-8')).hexdigest()[:20]
+
+        publish_request_id = _build_publish_request_id(ready_df)
+        publish_in_progress = bool(st.session_state.get('new_intake_publish_in_progress', False))
+        publish_history = st.session_state.get('new_intake_publish_history', {})
+        prior_result = publish_history.get(publish_request_id, {}) if publish_request_id else {}
+        prior_status = str((prior_result or {}).get('status') or '').upper()
+        already_processed = prior_status in {'DRY_RUN', 'POSTED', 'POSTED_WITH_WARNING'}
+
         publish_disabled = not duplicates_acknowledged
         if strict_publish_gate:
             if len(create_scope_df) > 0 and not duplicate_check_run_for_current:
@@ -2948,6 +3057,17 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                 publish_disabled = True
             if len(low_confidence_create_df) > 0:
                 publish_disabled = True
+
+        if publish_in_progress:
+            publish_disabled = True
+            st.info("A publish request is currently running. Please wait for it to complete.")
+
+        if already_processed:
+            publish_disabled = True
+            st.info(
+                f"This exact request was already processed in this session (request {publish_request_id}). "
+                "Change input rows or dry-run setting to submit a new request."
+            )
 
         if publish_disabled:
             st.info("Publish is blocked by quality checks. Resolve the messages above.")
@@ -2960,6 +3080,20 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                 st.error("Please confirm before publishing.")
                 return
 
+            if st.session_state.get('new_intake_publish_in_progress', False):
+                st.warning("A publish request is already running. Please wait.")
+                return
+
+            if already_processed:
+                st.warning(
+                    f"Skipped duplicate publish attempt for request {publish_request_id}. "
+                    "Refresh inputs to generate a new request ID."
+                )
+                st.session_state['new_intake_publish_result'] = prior_result
+                return
+
+            st.session_state['new_intake_publish_in_progress'] = True
+
             try:
                 with st.spinner("Posting new schools to DNEMIS..."):
                     publish_result = generator.post_new_schools_to_dhis2(
@@ -2967,10 +3101,11 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                         username=username,
                         password=password,
                         intake_df=ready_df,
-                        dry_run=dry_run
+                        dry_run=dry_run,
+                        batch_size=100,
+                        duplicate_matches=dup_results if duplicate_check_run_for_current else None
                     )
-                # Persist result so it survives st.rerun()
-                st.session_state['new_intake_publish_result'] = publish_result
+                publish_result['request_id'] = publish_request_id
 
                 def _normalize_school_code(code_value):
                     code_text = str(code_value or '').strip()
@@ -2981,7 +3116,8 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                         return digits_only.zfill(10)
                     return ''
 
-                uid_by_code = (publish_result.get('response', {}) or {}).get('uid_by_code', {})
+                response_payload = (publish_result.get('response', {}) or {})
+                uid_by_code = response_payload.get('uid_by_code', {})
                 if isinstance(uid_by_code, dict) and uid_by_code:
                     updated_df = result_df.copy()
                     if 'school_ou_uid' not in updated_df.columns:
@@ -3004,11 +3140,44 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                             populated_count += 1
 
                     st.session_state['new_intake_result_df'] = updated_df
-                    st.session_state['new_intake_publish_result']['_populated_count'] = populated_count
+
+                compact_response = dict(response_payload)
+                compact_uid_map = compact_response.pop('uid_by_code', {})
+                compact_response['uid_by_code_count'] = len(compact_uid_map) if isinstance(compact_uid_map, dict) else 0
+
+                skipped_rows = compact_response.get('skipped', [])
+                if isinstance(skipped_rows, list) and len(skipped_rows) > 50:
+                    compact_response['skipped_count'] = len(skipped_rows)
+                    compact_response['skipped_preview'] = skipped_rows[:50]
+                    compact_response['skipped'] = []
+
+                chunk_summaries = compact_response.get('chunk_summaries', [])
+                if isinstance(chunk_summaries, list) and len(chunk_summaries) > 100:
+                    compact_response['chunk_summaries'] = chunk_summaries[:100]
+                    compact_response['chunk_summaries_truncated'] = True
+
+                compact_publish_result = dict(publish_result)
+                compact_publish_result['response'] = compact_response
+                compact_publish_result['_populated_count'] = populated_count if 'populated_count' in locals() else 0
+
+                # Persist compact result so it survives reruns with lower memory footprint.
+                st.session_state['new_intake_publish_result'] = compact_publish_result
+
+                if publish_request_id and str(compact_publish_result.get('status', '')).upper() in {'DRY_RUN', 'POSTED', 'POSTED_WITH_WARNING'}:
+                    history = dict(st.session_state.get('new_intake_publish_history', {}))
+                    history[publish_request_id] = compact_publish_result
+                    # Keep history bounded for session memory safety.
+                    if len(history) > 20:
+                        oldest_keys = list(history.keys())[:-20]
+                        for old_key in oldest_keys:
+                            history.pop(old_key, None)
+                    st.session_state['new_intake_publish_history'] = history
 
                 st.rerun()
             except Exception as e:
                 st.error(f"Failed to publish new schools: {e}")
+            finally:
+                st.session_state['new_intake_publish_in_progress'] = False
 
         # Render publish result persistently (read from session state so it survives st.rerun())
         if 'new_intake_publish_result' in st.session_state:
@@ -3025,6 +3194,8 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
             populated_count = pr.get('_populated_count')
             if populated_count is not None:
                 st.caption(f"school_ou_uid populated for {populated_count} row(s) from DNEMIS response.")
+            if pr.get('request_id'):
+                st.caption(f"Publish request ID: {pr.get('request_id')}")
             st.json(pr.get('response', {}))
 
 def display_school_list_results(result_df, original_file, original_stats, processing_stats, duplicates):
