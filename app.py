@@ -3265,68 +3265,103 @@ def state_info_ui(generator):
 
 def about_ui():
     st.header("About Nigeria School Code Generator")
-    
+
     st.markdown("""
     ## 🎯 Purpose
-    This web application generates unique school codes for all Nigerian states and Local Government Areas (LGAs) 
-    following the official format: `SSLLXXXXXX`
-    
+    This web application generates and manages unique school codes for all Nigerian states and Local Government 
+    Areas (LGAs) following the official DNEMIS format: `SSLLXXXXXX`
+
     - **SS**: State code (2 digits)
-    - **LL**: LGA code (2 digits) 
-    - **XXXXXX**: School serial number (6 digits)
-    
+    - **LL**: LGA code (2 digits)
+    - **XXXXXX**: School serial number (6 digits, zero-padded)
+
     ## 📊 Coverage
     - **36 States** + Federal Capital Territory (FCT)
     - **774 Local Government Areas** nationwide
-    - **Official numbering** for all states and LGAs
-    
+    - **Official SSLL numbering** for all states and LGAs
+
+    ---
+
     ## 🚀 Features
+
     ### 1. Generate Codes
-    - Generate codes for specific LGAs or entire states
-    - Prevent duplicates by checking existing codes
-    - Multiple download formats (CSV, Excel, TXT)
-    
-    ### 2. Process School List (NEW)
-    - Upload Excel/CSV files with school lists
-    - **Automatic handling of leading zeros** in lgacode
-    - **Case-insensitive column names** (State, state, STATE all work)
-    - Assign unique school codes to each school
-    - Group by LGA and assign sequential serial numbers
-    - Preserve all existing data in the file
+    - Generate school codes for specific LGAs or entire states
+    - Specify the number of schools to code per LGA
+    - Upload existing codes to avoid duplicates
+    - Download results as CSV, Excel, or TXT
+
+    ### 2. Process School List
+    - Upload an Excel/CSV file containing a school list
+    - **Case-insensitive column name matching** — `State`, `state`, and `STATE` all work
+    - **Automatic leading-zero padding** for lgacode (e.g. `101` → `0101`)
+    - Groups schools by LGA and assigns sequential serial numbers
+    - Preserves all original columns in the output
+    - **Comprehensive statistics**: LGA breakdown, serial ranges, duplicate analysis
     - Download the updated file with generated codes
-    - **Comprehensive statistics** on uploaded files
-    - **Duplicate detection** and reporting
-    
-    ## ⚠️ Important Note for School List Processing
-    When uploading Excel files with lgacode column:
-    - Excel may drop leading zeros from numbers (e.g., `0101` becomes `101`)
-    - The tool automatically pads numbers to 4 digits with leading zeros
-    - Examples: `101` → `0101`, `201` → `0201`, `2401` → `2401`
-    
-    ## 📝 Usage
-    ### For School List Processing:
-    1. Prepare Excel/CSV file with required columns
-    2. Ensure 'lgacode' column contains SS+LL format
-    3. Upload the file
-    4. View comprehensive statistics and duplicate reports
-    5. Generate and download results
-    
-    ### For Bulk Code Generation:
-    1. Select a state and LGAs
-    2. Specify number of schools per LGA
-    3. Upload existing School codes (optional, to avoid duplicates)
-    4. Generate and download results
-    
+
+    ### 3. 🆕 New School Intake *(DNEMIS-connected)*
+    The flagship workflow for onboarding entirely new schools directly into DNEMIS:
+
+    - Upload a new-schools list (CSV/XLSX) with columns: `school_name`, `school_level`, `state`, `lga`, `ward`,
+      `lgacode`, `old_schoolcode`, `openingDate`
+    - **State / LGA / Ward resolution**: matches each row to the official OU reference hierarchy using both
+      exact and fuzzy matching; flags unresolved rows before any code is assigned
+    - **Live serial tracking**: queries DNEMIS for all existing Level-5 OUs under each State and picks up
+      exactly where the last school code left off — no gaps, no overlaps
+    - **School name formatting** (applied automatically):
+        - Leading/trailing spaces are trimmed; internal whitespace is collapsed
+        - Name is converted to **Proper Case** before any prefix or suffix is added
+        - The `school_level` column is the **authoritative prefix source** (`JSS`, `SSS`, `PRY`, `TVET`,
+          `PVT`, `IQS`); a prefix already embedded in the name is only used as a fallback
+        - Final format: `PREFIX School Name (CODE)` — e.g. `JSS Government Secondary School Wuse (0901000001)`
+        - If `old_schoolcode` is provided it becomes the code suffix; otherwise the newly generated code is used
+    - **Duplicate name check**: before publishing, queries DNEMIS for existing Level-5 OUs in each LGA and
+      reports exact and partial name matches (fuzzy)
+    - **Strict publish gate**: blocks publishing until the duplicate check has been run, all create rows have
+      a valid school-level prefix, and fuzzy parent-match scores meet the confidence threshold
+    - **Dry-run mode**: preview what would be created/updated without touching DNEMIS
+    - **Publish to DNEMIS**: creates new OUs via the DHIS2 API with full payload (name, shortName, code,
+      openingDate, parent OU)
+
+    ### 4. DHIS2 Level-5 OU Code Update
+    - Connect to any DHIS2/DNEMIS instance with credentials
+    - Load all Level-2 OUs and select a State
+    - Fetch all Level-5 OUs (schools) under that State with pagination support
+    - Preview proposed `SSLLXXXXXX` codes before applying
+    - Two update modes:
+        - **Safe per-OU PUT** — preserves full OU payload including coordinates
+        - **Fast bulk `/metadata`** — best for very large batches
+    - Existing valid 10-digit codes are preserved; only unset or malformed codes are updated
+
+    ### 5. State Information
+    - Browse official LGA codes for every state
+    - Quick reference for `SS` and `LL` digit assignments
+
+    ---
+
+    ## ⚠️ Important Notes
+
+    **Excel leading-zero issue**: Excel silently drops leading zeros from numeric cells (e.g. `0101` → `101`).
+    The tool automatically re-pads lgacode values to 4 digits.
+
+    **School name rules**:
+    - Always provide `school_level` to ensure the correct prefix is used
+    - `old_schoolcode` must **not** be a 10-digit number (those are new DNEMIS codes, not legacy identifiers)
+    - Rows without a valid prefix are flagged and blocked from publishing under the strict gate
+
+    **Required intake columns**: `school_name` plus either `lgacode` or (`state` + `lga`)
+
+    ---
+
     ## 🛠️ Technical Details
-    - Built with Streamlit
-    - Uses official Nigerian government LGA numbering
-    - Supports CSV, Excel, and text file formats
-    - Handles Excel's automatic number formatting issues
-    - Case-insensitive column name matching
-    - Comprehensive duplicate detection and reporting
+    - Built with **Streamlit**
+    - Uses the **DHIS2 REST API** for live DNEMIS integration
+    - OU reference hierarchy loaded from a bundled CSV (`ou_index_2026.csv`) or fetched securely at runtime
+    - Supports CSV, Excel (`.xlsx`/`.xls`), and plain-text file formats
+    - Fuzzy string matching for ward/LGA resolution
     """)
-    
-    st.info("💡 **Tip**: Use the 'State Information' section to view all LGAs and their official codes for any state.")
+
+    st.info("💡 **Tip**: Use the **State Information** tab to look up any state's official LGA codes before generating.")
 
 if __name__ == "__main__":
     main()
