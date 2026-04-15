@@ -451,13 +451,20 @@ class SchoolCodeGenerator:
             'islamic': 'IQS'
         }
 
-        return level_map.get(normalized_text, str(school_level or '').strip().upper() if normalized_text in {'jss', 'sss', 'pry', 'tvet', 'pvt', 'iqs'} else '')
+        return level_map.get(normalized_text, str(school_level or '').strip().upper())
 
     def _format_school_name_with_prefix_and_code(self, school_name, school_code, school_level=''):
         valid_prefixes = {'JSS', 'SSS', 'PRY', 'TVET', 'PVT', 'IQS'}
 
-        name_text = str(school_name or '').strip()
+        def _to_proper_case(value):
+            text = re.sub(r'\s+', ' ', str(value or '').strip())
+            if not text:
+                return ''
+            return ' '.join(part.capitalize() for part in text.split(' '))
+
+        name_text = _to_proper_case(str(school_name or ''))
         code_text = str(school_code or '').strip()
+        prefix_from_level = self._normalize_school_level(school_level)
 
         if not name_text:
             return '', '', False
@@ -470,8 +477,10 @@ class SchoolCodeGenerator:
             flags=re.IGNORECASE
         )
         if preformatted_match:
-            preserved_prefix = str(preformatted_match.group(1) or '').upper().strip()
-            preserved_core_name = str(preformatted_match.group(2) or '').strip()
+            # school_level column takes priority as the authoritative prefix source
+            name_prefix = str(preformatted_match.group(1) or '').upper().strip()
+            preserved_prefix = (prefix_from_level if prefix_from_level in valid_prefixes else name_prefix)
+            preserved_core_name = _to_proper_case(preformatted_match.group(2))
             rebuilt_name = re.sub(r'\s+', ' ', f"{preserved_prefix} {preserved_core_name}").strip()
             if code_text:
                 rebuilt_name = f"{rebuilt_name} ({code_text})"
@@ -482,12 +491,13 @@ class SchoolCodeGenerator:
 
         # Remove any existing valid prefix from the start; the final prefix should come from school_level when provided.
         core_name = re.sub(r'^(JSS|SSS|PRY|TVET|PVT|IQS)\b\s*', '', name_without_suffix, flags=re.IGNORECASE).strip()
+        core_name = _to_proper_case(core_name)
 
-        prefix_from_level = self._normalize_school_level(school_level)
         prefix_match = re.match(r'^(JSS|SSS|PRY|TVET|PVT|IQS)\b\s*(.*)$', name_without_suffix, flags=re.IGNORECASE)
         prefix_from_name = str(prefix_match.group(1) or '').upper().strip() if prefix_match else ''
 
-        prefix = prefix_from_level or prefix_from_name
+        # school_level column is the authoritative prefix source; fall back to prefix embedded in the name
+        prefix = prefix_from_level if prefix_from_level in valid_prefixes else prefix_from_name
         if prefix not in valid_prefixes:
             prefix = ''
 
