@@ -816,6 +816,19 @@ class SchoolCodeGenerator:
                 else:
                     match_status = 'resolved_with_warning'
                     match_notes = 'LGA matched, but ward was not found in the reference file'
+
+            if not ward_uid:
+                unknown_ward_uid, unknown_ward_name = self._find_unknown_ward_uid(matched_lga['lgauid'], ward_reference_df)
+                if unknown_ward_uid:
+                    ward_uid = unknown_ward_uid
+                    reference_ward = unknown_ward_name
+                    parent_match_type = 'unknown_fallback'
+                    parent_match_score = 60.0
+                    match_status = 'resolved_with_warning'
+                    match_notes = 'LGA matched; ward was provided but not matched, so Unknown Ward parent was assigned'
+                else:
+                    match_status = 'resolved_with_warning'
+                    match_notes = 'LGA matched; ward was provided but not matched, and no Unknown Ward exists for this LGA'
         else:
             center_uid, center_ward_name, center_score = self._match_lga_center_ward(
                 lga_name=matched_lga['lga (level3)'],
