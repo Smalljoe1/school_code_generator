@@ -5,11 +5,14 @@ import os
 import re
 import requests
 from io import BytesIO
+from difflib import SequenceMatcher
 
 class SchoolCodeGenerator:
     def __init__(self):
         self.ou_reference_filename = "State_LGA_Wards_OUs_List.csv"
         self.ou_reference_alias_filename = "ou_index_2026.csv"
+        self.parent_match_fuzzy_threshold = 75
+        self.parent_match_confident_threshold = 85
         self.state_codes = {
                 'abia': '01', 'adamawa': '02', 'akwa ibom': '03', 'anambra': '04',
                 'bauchi': '05', 'bayelsa': '06', 'benue': '07', 'borno': '08',
@@ -603,6 +606,91 @@ class SchoolCodeGenerator:
         row_variants = set(str(row_value or '').split('|'))
         return bool(row_variants.intersection(variants))
 
+    def _similarity_score(self, left_text, right_text):
+        left = self._normalize_text(left_text)
+        right = self._normalize_text(right_text)
+        if not left or not right:
+            return 0.0
+
+        if left == right:
+            return 100.0
+
+        seq_score = SequenceMatcher(None, left, right).ratio() * 100.0
+        left_tokens = set(left.split())
+        right_tokens = set(right.split())
+        overlap = left_tokens.intersection(right_tokens)
+        token_score = (len(overlap) / max(1, len(left_tokens.union(right_tokens)))) * 100.0
+
+        containment_score = 0.0
+        if left in right or right in left:
+            containment_score = 100.0
+
+        return (seq_score * 0.5) + (token_score * 0.3) + (containment_score * 0.2)
+
+    def _fuzzy_match_ward_within_lga(self, ward_input, lgauid, ward_reference_df):
+        lga_wards = ward_reference_df[ward_reference_df['lgauid'] == lgauid]
+        if len(lga_wards) == 0:
+            return '', '', 0.0
+
+        ward_input_text = str(ward_input or '').strip()
+        if not ward_input_text:
+            return '', '', 0.0
+
+        best_uid = ''
+        best_name = ''
+        best_score = 0.0
+
+        for _, candidate in lga_wards.iterrows():
+            ward_name = str(candidate.get('ward (level 4)', '') or '').strip()
+            ward_uid = str(candidate.get('warduid', '') or '').strip()
+            if not ward_name or not ward_uid:
+                continue
+
+            score = self._similarity_score(ward_input_text, ward_name)
+            if score > best_score:
+                best_score = score
+                best_uid = ward_uid
+                best_name = ward_name
+
+        if best_score >= float(self.parent_match_fuzzy_threshold):
+            return best_uid, best_name, round(best_score, 1)
+
+        return '', '', 0.0
+
+    def _match_lga_center_ward(self, lga_name, lgauid, ward_reference_df):
+        lga_wards = ward_reference_df[ward_reference_df['lgauid'] == lgauid]
+        if len(lga_wards) == 0:
+            return '', '', 0.0
+
+        lga_text = self._normalize_text(lga_name)
+        center_candidates = [
+            f"{lga_text} central",
+            f"{lga_text} town",
+            f"{lga_text} ward 1",
+            lga_text
+        ]
+
+        best_uid = ''
+        best_name = ''
+        best_score = 0.0
+
+        for _, candidate in lga_wards.iterrows():
+            ward_name = str(candidate.get('ward (level 4)', '') or '').strip()
+            ward_uid = str(candidate.get('warduid', '') or '').strip()
+            if not ward_name or not ward_uid:
+                continue
+
+            candidate_score = max(self._similarity_score(pattern, ward_name) for pattern in center_candidates)
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_uid = ward_uid
+                best_name = ward_name
+
+        if best_score >= float(self.parent_match_fuzzy_threshold):
+            return best_uid, best_name, round(best_score, 1)
+
+        return '', '', 0.0
+
     def _find_unknown_ward_uid(self, lgauid, ward_reference_df):
         lga_wards = ward_reference_df[ward_reference_df['lgauid'] == lgauid]
         if len(lga_wards) == 0:
@@ -647,6 +735,9 @@ class SchoolCodeGenerator:
                 'resolved_lgacode': lgacode,
                 'parentuid_for_create': '',
                 'parent_source': '',
+                'parent_match_type': 'unresolved',
+                'parent_match_score': 0.0,
+                'parent_candidate_count': 0,
                 'reference_state': '',
                 'reference_lga': '',
                 'reference_ward': ''
@@ -662,6 +753,9 @@ class SchoolCodeGenerator:
                 'resolved_lgacode': lgacode,
                 'parentuid_for_create': '',
                 'parent_source': '',
+                'parent_match_type': 'unresolved',
+                'parent_match_score': 0.0,
+                'parent_candidate_count': int(len(candidates)),
                 'reference_state': '',
                 'reference_lga': '',
                 'reference_ward': ''
@@ -672,31 +766,79 @@ class SchoolCodeGenerator:
         ward_uid = ''
         match_status = 'resolved'
         match_notes = 'Matched against OU reference file'
+        parent_match_type = 'unresolved'
+        parent_match_score = 0.0
+        parent_candidate_count = 0
+        input_ward = str(row.get('ward', '') or '').strip()
 
         if ward_variants:
             ward_candidates = ward_reference_df[
                 (ward_reference_df['lgauid'] == matched_lga['lgauid']) &
                 (ward_reference_df['ward_key'].apply(lambda value: self._row_matches_variants(value, ward_variants)))
             ]
+            parent_candidate_count = int(len(ward_candidates))
 
             if len(ward_candidates) == 1:
                 matched_ward = ward_candidates.iloc[0]
                 reference_ward = matched_ward['ward (level 4)']
                 ward_uid = matched_ward['warduid']
+                parent_match_type = 'exact_ward'
+                parent_match_score = 100.0
             elif len(ward_candidates) > 1:
-                match_status = 'resolved_with_warning'
-                match_notes = 'LGA matched, but ward matched multiple records'
+                fuzzy_uid, fuzzy_ward_name, fuzzy_score = self._fuzzy_match_ward_within_lga(
+                    ward_input=input_ward,
+                    lgauid=matched_lga['lgauid'],
+                    ward_reference_df=ward_reference_df
+                )
+                if fuzzy_uid:
+                    ward_uid = fuzzy_uid
+                    reference_ward = fuzzy_ward_name
+                    parent_match_type = 'fuzzy_ward'
+                    parent_match_score = float(fuzzy_score)
+                    match_status = 'resolved_with_warning' if fuzzy_score < self.parent_match_confident_threshold else 'resolved'
+                    match_notes = f"Ward had multiple exact candidates; fuzzy-selected '{fuzzy_ward_name}' (score={fuzzy_score})."
+                else:
+                    match_status = 'resolved_with_warning'
+                    match_notes = 'LGA matched, but ward matched multiple records'
             else:
-                match_status = 'resolved_with_warning'
-                match_notes = 'LGA matched, but ward was not found in the reference file'
+                fuzzy_uid, fuzzy_ward_name, fuzzy_score = self._fuzzy_match_ward_within_lga(
+                    ward_input=input_ward,
+                    lgauid=matched_lga['lgauid'],
+                    ward_reference_df=ward_reference_df
+                )
+                if fuzzy_uid:
+                    ward_uid = fuzzy_uid
+                    reference_ward = fuzzy_ward_name
+                    parent_match_type = 'fuzzy_ward'
+                    parent_match_score = float(fuzzy_score)
+                    match_status = 'resolved_with_warning' if fuzzy_score < self.parent_match_confident_threshold else 'resolved'
+                    match_notes = f"LGA matched; ward fuzzy-matched to '{fuzzy_ward_name}' (score={fuzzy_score})."
+                else:
+                    match_status = 'resolved_with_warning'
+                    match_notes = 'LGA matched, but ward was not found in the reference file'
         else:
+            center_uid, center_ward_name, center_score = self._match_lga_center_ward(
+                lga_name=matched_lga['lga (level3)'],
+                lgauid=matched_lga['lgauid'],
+                ward_reference_df=ward_reference_df
+            )
+            if center_uid:
+                ward_uid = center_uid
+                reference_ward = center_ward_name
+                parent_match_type = 'lga_center'
+                parent_match_score = float(center_score)
+                match_status = 'resolved_with_warning'
+                match_notes = f"LGA matched; ward blank, so LGA-center ward '{center_ward_name}' was assigned (score={center_score})."
+
             unknown_ward_uid, unknown_ward_name = self._find_unknown_ward_uid(matched_lga['lgauid'], ward_reference_df)
-            if unknown_ward_uid:
+            if not ward_uid and unknown_ward_uid:
                 ward_uid = unknown_ward_uid
                 reference_ward = unknown_ward_name
+                parent_match_type = 'unknown_fallback'
+                parent_match_score = 60.0
                 match_status = 'resolved_with_warning'
                 match_notes = 'LGA matched; ward was blank, so Unknown Ward parent was assigned'
-            else:
+            elif not ward_uid:
                 match_status = 'resolved_with_warning'
                 match_notes = 'LGA matched; ward was blank and no Unknown Ward exists for this LGA'
 
@@ -712,6 +854,9 @@ class SchoolCodeGenerator:
             'resolved_lgacode': matched_lga['lgacode (ssll)'],
             'parentuid_for_create': parentuid_for_create,
             'parent_source': parent_source,
+            'parent_match_type': parent_match_type,
+            'parent_match_score': round(float(parent_match_score), 1),
+            'parent_candidate_count': int(parent_candidate_count),
             'reference_state': matched_lga['state (level2)'],
             'reference_lga': matched_lga['lga (level3)'],
             'reference_ward': reference_ward
@@ -926,11 +1071,19 @@ class SchoolCodeGenerator:
                 result_df['match_status'].isin(['resolved', 'resolved_with_warning']) &
                 result_df['school_code'].astype(str).str.match(r'^\d{10}$') &
                 result_df['parentuid_for_create'].astype(str).str.strip().ne('') &
+                result_df['parent_match_type'].astype(str).str.strip().ne('unresolved') &
                 result_df['name_format_valid'].astype(bool) &
                 result_df['school_name'].astype(str).str.strip().ne('')
             )
 
             unresolved_df = result_df[result_df['match_status'] == 'unresolved']
+            parent_match_counts = result_df['parent_match_type'].astype(str).value_counts().to_dict() if 'parent_match_type' in result_df.columns else {}
+            fuzzy_low_confidence_count = int(
+                (
+                    result_df['parent_match_type'].astype(str).eq('fuzzy_ward') &
+                    (pd.to_numeric(result_df['parent_match_score'], errors='coerce').fillna(0) < float(self.parent_match_confident_threshold))
+                ).sum()
+            ) if 'parent_match_score' in result_df.columns else 0
             processing_stats = {
                 'reference_file_path': reference_file_path,
                 'input_rows': len(result_df),
@@ -953,6 +1106,8 @@ class SchoolCodeGenerator:
                 'openingdate_defaulted_count': int((opening_date_missing_mask | opening_date_invalid_mask).sum()),
                 'openingdate_invalid_count': int(opening_date_invalid_mask.sum()),
                 'ready_to_post_count': int(result_df['can_post'].sum()),
+                'parent_match_counts': parent_match_counts,
+                'fuzzy_low_confidence_count': fuzzy_low_confidence_count,
                 'unresolved_preview': unresolved_df[['school_name', 'state', 'lga', 'ward', 'match_notes']].head(20).to_dict('records')
             }
 
@@ -960,7 +1115,8 @@ class SchoolCodeGenerator:
                 'school_code', 'school_ou_uid', 'school_level', 'old_schoolcode', 'name_suffix_code_used',
                 'school_level_normalized', 'name_format_valid',
                 'allocated_serial', 'existing_max_serial', 'openingdate', 'lgacode', 'input_lgacode', 'level2uid',
-                'lgauid', 'warduid', 'parentuid_for_create', 'parent_source', 'match_status', 'match_notes', 'reference_state',
+                'lgauid', 'warduid', 'parentuid_for_create', 'parent_source', 'parent_match_type', 'parent_match_score',
+                'parent_candidate_count', 'match_status', 'match_notes', 'reference_state',
                 'reference_lga', 'reference_ward'
             ]
             for column in output_columns:
@@ -2398,6 +2554,23 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         with col11:
             st.metric("school_level Invalid", processing_stats.get('school_level_invalid_count', 0))
 
+        parent_match_counts = processing_stats.get('parent_match_counts', {})
+        col12, col13, col14, col15 = st.columns(4)
+        with col12:
+            st.metric("Parent Exact", int(parent_match_counts.get('exact_ward', 0)))
+        with col13:
+            st.metric("Parent Fuzzy", int(parent_match_counts.get('fuzzy_ward', 0)))
+        with col14:
+            st.metric("LGA Center", int(parent_match_counts.get('lga_center', 0)))
+        with col15:
+            st.metric("Unknown Fallback", int(parent_match_counts.get('unknown_fallback', 0)))
+
+        if processing_stats.get('fuzzy_low_confidence_count', 0) > 0:
+            st.warning(
+                f"{processing_stats.get('fuzzy_low_confidence_count', 0)} row(s) were fuzzy matched with score below "
+                f"{int(generator.parent_match_confident_threshold)}. Review before publishing."
+            )
+
         st.caption(f"old_schoolcode used in name suffix for {processing_stats.get('old_schoolcode_used_count', 0)} row(s).")
         if processing_stats.get('old_schoolcode_invalid_ten_digit_count', 0) > 0:
             st.warning(
@@ -2413,7 +2586,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         preview_columns = [
             'school_code', 'school_ou_uid', 'school_level', 'school_level_normalized', 'name_format_valid',
             'old_schoolcode', 'name_suffix_code_used', 'lgacode', 'reference_lga', 'school_name', 'state', 'lga',
-            'ward', 'openingdate', 'parentuid_for_create', 'match_status', 'match_notes'
+            'ward', 'openingdate', 'parentuid_for_create', 'parent_match_type', 'parent_match_score', 'match_status', 'match_notes'
         ]
         available_preview_columns = [column for column in preview_columns if column in result_df.columns]
         st.dataframe(result_df[available_preview_columns].head(20), use_container_width=True)
@@ -2435,10 +2608,28 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         no_parent_df = result_df[result_df['parentuid_for_create'].astype(str).str.strip() == '']
         if not no_parent_df.empty:
             st.warning("Some rows do not have a parent UID for create and cannot be published yet.")
+            no_parent_columns = [
+                column for column in ['school_name', 'state', 'lga', 'ward', 'parent_match_type', 'parent_match_score', 'match_notes']
+                if column in no_parent_df.columns
+            ]
             st.dataframe(
-                no_parent_df[['school_name', 'state', 'lga', 'ward', 'match_notes']].head(20),
+                no_parent_df[no_parent_columns].head(20),
                 use_container_width=True
             )
+
+        low_confidence_df = result_df[
+            result_df['parent_match_type'].astype(str).eq('fuzzy_ward') &
+            (pd.to_numeric(result_df['parent_match_score'], errors='coerce').fillna(0) < float(generator.parent_match_confident_threshold))
+        ] if ('parent_match_type' in result_df.columns and 'parent_match_score' in result_df.columns) else pd.DataFrame()
+        if not low_confidence_df.empty:
+            st.warning("Some rows have low-confidence fuzzy parent matches. Review before publishing.")
+            low_confidence_columns = [
+                column for column in [
+                    'school_name', 'state', 'lga', 'ward', 'reference_ward',
+                    'parent_match_type', 'parent_match_score', 'parentuid_for_create', 'match_notes'
+                ] if column in low_confidence_df.columns
+            ]
+            st.dataframe(low_confidence_df[low_confidence_columns].head(20), use_container_width=True)
 
         invalid_level_df = result_df[~result_df['name_format_valid'].astype(bool)] if 'name_format_valid' in result_df.columns else pd.DataFrame()
         if not invalid_level_df.empty:
@@ -2537,6 +2728,14 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         else:
             invalid_level_create_df = pd.DataFrame()
 
+        if 'parent_match_type' in create_scope_df.columns and 'parent_match_score' in create_scope_df.columns:
+            low_confidence_create_df = create_scope_df[
+                create_scope_df['parent_match_type'].astype(str).eq('fuzzy_ward') &
+                (pd.to_numeric(create_scope_df['parent_match_score'], errors='coerce').fillna(0) < float(generator.parent_match_confident_threshold))
+            ].copy()
+        else:
+            low_confidence_create_df = pd.DataFrame()
+
         create_codes_signature = '|'.join(sorted(create_scope_df['school_code'].astype(str).tolist())) if 'school_code' in create_scope_df.columns else ''
         update_count_preview = len(ready_df) - len(create_df)
         st.caption(f"{len(create_df)} new create(s), {update_count_preview} update(s) in ready set.")
@@ -2544,7 +2743,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         ready_preview_columns = [
             column for column in [
                 'school_name', 'school_level', 'old_schoolcode', 'name_suffix_code_used', 'school_level_normalized', 'school_code',
-                'school_ou_uid', 'openingdate', 'parentuid_for_create', 'reference_lga'
+                'school_ou_uid', 'openingdate', 'parentuid_for_create', 'parent_match_type', 'parent_match_score', 'reference_lga'
             ] if column in ready_df.columns
         ]
         st.dataframe(
@@ -2611,7 +2810,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         # ── Publish ──────────────────────────────────────────────────────────
         st.subheader("Step 2 — Publish to DNEMIS")
         strict_publish_gate = st.checkbox(
-            "Strict gate: block publish unless duplicate-check was run and school_level is valid for all create rows",
+            "Strict gate: block publish unless duplicate-check was run, school_level is valid, and fuzzy parent matches are high confidence",
             value=True,
             key='new_intake_strict_publish_gate'
         )
@@ -2630,6 +2829,19 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                 ]
                 st.dataframe(invalid_level_create_df[invalid_preview_columns].head(20), use_container_width=True)
 
+            if len(low_confidence_create_df) > 0:
+                st.warning(
+                    f"Strict gate active: {len(low_confidence_create_df)} create row(s) have fuzzy parent-match score below "
+                    f"{int(generator.parent_match_confident_threshold)}."
+                )
+                confidence_preview_columns = [
+                    column for column in [
+                        'school_name', 'state', 'lga', 'ward', 'reference_ward',
+                        'parent_match_type', 'parent_match_score', 'parentuid_for_create', 'match_notes'
+                    ] if column in low_confidence_create_df.columns
+                ]
+                st.dataframe(low_confidence_create_df[confidence_preview_columns].head(20), use_container_width=True)
+
         dry_run = st.checkbox("Dry run only (recommended first)", value=True, key='new_intake_publish_dry_run')
         confirm_publish = st.checkbox("I confirm I want to create or update these schools on DNEMIS", key='new_intake_publish_confirm')
 
@@ -2638,6 +2850,8 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
             if len(create_scope_df) > 0 and not duplicate_check_run_for_current:
                 publish_disabled = True
             if len(invalid_level_create_df) > 0:
+                publish_disabled = True
+            if len(low_confidence_create_df) > 0:
                 publish_disabled = True
 
         if publish_disabled:
