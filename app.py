@@ -5,6 +5,9 @@ import os
 import re
 import requests
 import hashlib
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from io import BytesIO
 from difflib import SequenceMatcher
 
@@ -14,6 +17,8 @@ class SchoolCodeGenerator:
         self.ou_reference_alias_filename = "ou_index_2026.csv"
         self.parent_match_fuzzy_threshold = 75
         self.parent_match_confident_threshold = 85
+        self.dhis_parallel_fetch_workers = 10
+        self.dhis_duplicate_check_workers = 10
         self.state_codes = {
                 'abia': '01', 'adamawa': '02', 'akwa ibom': '03', 'anambra': '04',
                 'bauchi': '05', 'bayelsa': '06', 'benue': '07', 'borno': '08',
@@ -530,6 +535,27 @@ class SchoolCodeGenerator:
             return code_text
         return ''
 
+    def _build_school_name_match_keys(self, school_name):
+        name_text = str(school_name or '').strip()
+        if not name_text:
+            return []
+
+        def _norm(value):
+            return re.sub(r'[\s\W]+', ' ', str(value or '').lower()).strip()
+
+        keys = []
+        full_key = _norm(name_text)
+        if full_key:
+            keys.append(full_key)
+
+        name_without_suffix = re.sub(r'\s*\(\s*[^()]+\s*\)\s*$', '', name_text).strip()
+        core_name = re.sub(r'^(JSS|SSS|PRY|TVET|PVT|IQS)\b\s*', '', name_without_suffix, flags=re.IGNORECASE).strip()
+        core_key = _norm(core_name)
+        if core_key and core_key not in keys:
+            keys.append(core_key)
+
+        return keys
+
     def _get_ou_reference_path(self):
         for candidate in self._get_ou_reference_candidate_paths():
             if os.path.exists(candidate):
@@ -887,24 +913,79 @@ class SchoolCodeGenerator:
         }
 
     def fetch_level5_under_multiple_level2(self, base_url, username, password, level2_ids, on_progress=None):
-        all_ous = []
-        total_states = len(level2_ids)
+        ordered_level2_ids = [str(level2_id).strip() for level2_id in level2_ids if str(level2_id).strip()]
+        total_states = len(ordered_level2_ids)
+        if total_states == 0:
+            return []
 
-        for index, level2_id in enumerate(level2_ids, start=1):
-            if on_progress:
-                on_progress('state_start', index, total_states, level2_id, len(all_ous))
+        max_workers = max(1, min(self.dhis_parallel_fetch_workers, total_states))
+        if max_workers == 1:
+            all_ous = []
+            for index, level2_id in enumerate(ordered_level2_ids, start=1):
+                if on_progress:
+                    on_progress('state_start', index, total_states, level2_id, len(all_ous))
 
+                state_ous = self.fetch_level5_under_level2(
+                    base_url=base_url,
+                    username=username,
+                    password=password,
+                    level2_id=level2_id,
+                    on_progress=(
+                        lambda fetched, total_pages, page, idx=index, total=total_states, current_level2=level2_id:
+                        on_progress('page', idx, total, current_level2, len(all_ous) + fetched, total_pages, page)
+                    ) if on_progress else None
+                )
+                all_ous.extend(state_ous)
+            return all_ous
+
+        progress_lock = Lock()
+        progress_by_level2 = {level2_id: 0 for level2_id in ordered_level2_ids}
+        page_count_by_level2 = {level2_id: 0 for level2_id in ordered_level2_ids}
+
+        def _report_progress(event_type, state_index, level2_id, fetched_count, total_pages=None, page=None):
+            if not on_progress:
+                return
+            with progress_lock:
+                progress_by_level2[level2_id] = fetched_count
+                if total_pages is not None:
+                    page_count_by_level2[level2_id] = total_pages
+                aggregate_fetched = sum(progress_by_level2.values())
+            on_progress(event_type, state_index, total_states, level2_id, aggregate_fetched, total_pages, page)
+
+        def _fetch_single_level2(state_index, level2_id):
+            _report_progress('state_start', state_index, level2_id, 0)
             state_ous = self.fetch_level5_under_level2(
                 base_url=base_url,
                 username=username,
                 password=password,
                 level2_id=level2_id,
                 on_progress=(
-                    lambda fetched, total_pages, page, idx=index, total=total_states, current_level2=level2_id:
-                    on_progress('page', idx, total, current_level2, len(all_ous) + fetched, total_pages, page)
+                    lambda fetched, total_pages, page, idx=state_index, current_level2=level2_id:
+                    _report_progress('page', idx, current_level2, fetched, total_pages, page)
                 ) if on_progress else None
             )
-            all_ous.extend(state_ous)
+            _report_progress('state_done', state_index, level2_id, len(state_ous), page_count_by_level2.get(level2_id, 0), None)
+            return state_index, state_ous
+
+        all_ous_by_index = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_state = {
+                executor.submit(_fetch_single_level2, index, level2_id): (index, level2_id)
+                for index, level2_id in enumerate(ordered_level2_ids, start=1)
+            }
+
+            for future in as_completed(future_to_state):
+                state_index, level2_id = future_to_state[future]
+                try:
+                    result_index, state_ous = future.result()
+                    all_ous_by_index[result_index] = state_ous
+                except Exception:
+                    _report_progress('state_error', state_index, level2_id, progress_by_level2.get(level2_id, 0), page_count_by_level2.get(level2_id, 0), None)
+                    raise
+
+        all_ous = []
+        for index in range(1, total_states + 1):
+            all_ous.extend(all_ous_by_index.get(index, []))
 
         return all_ous
 
@@ -1169,8 +1250,14 @@ class SchoolCodeGenerator:
           incoming_school_name, incoming_school_code, lgauid, reference_lga,
           matched_dhis2_name, matched_dhis2_code, matched_dhis2_uid, match_type
         """
-        def _norm(text):
-            return re.sub(r'[\s\W]+', ' ', str(text or '').lower()).strip()
+        def _match_rank(match_type):
+            rank_map = {
+                'EXACT': 4,
+                'EXACT_CORE': 3,
+                'PARTIAL': 2,
+                'PARTIAL_CORE': 1
+            }
+            return rank_map.get(str(match_type or '').upper(), 0)
 
         create_rows = intake_df[
             intake_df.get('can_post', intake_df.index.isin(intake_df.index)).astype(bool) &
@@ -1184,7 +1271,9 @@ class SchoolCodeGenerator:
 
         # Build lookup: lgauid -> list of existing Level-5 OUs
         lga_children = {}
-        for lgauid in unique_lga_uids:
+        max_workers = max(1, min(self.dhis_duplicate_check_workers, len(unique_lga_uids))) if unique_lga_uids else 1
+
+        def _fetch_lga_children(lgauid):
             try:
                 resp = self._dhis_request(
                     method='GET',
@@ -1198,33 +1287,60 @@ class SchoolCodeGenerator:
                         ('filter', f'path:like:{lgauid}'),
                         ('paging', 'false')
                     ],
-                    timeout=60
+                    timeout=(10, 90),
+                    max_retries=4
                 )
-                lga_children[lgauid] = resp.json().get('organisationUnits', [])
+                return lgauid, resp.json().get('organisationUnits', [])
             except Exception:
-                lga_children[lgauid] = []
+                return lgauid, []
+
+        if max_workers == 1:
+            for lgauid in unique_lga_uids:
+                fetched_lgauid, ous = _fetch_lga_children(lgauid)
+                lga_children[fetched_lgauid] = ous
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_lga = {
+                    executor.submit(_fetch_lga_children, lgauid): lgauid
+                    for lgauid in unique_lga_uids
+                }
+                for future in as_completed(future_to_lga):
+                    fetched_lgauid, ous = future.result()
+                    lga_children[fetched_lgauid] = ous
 
         matches = []
+        seen_matches = {}
         for _, row in create_rows.iterrows():
             lgauid = str(row.get('lgauid') or '').strip()
             incoming_name = str(row.get('school_name') or '').strip()
             incoming_code = str(row.get('school_code') or '').strip()
-            incoming_norm = _norm(incoming_name)
-            if not lgauid or not incoming_name:
+            incoming_keys = self._build_school_name_match_keys(incoming_name)
+            incoming_full = incoming_keys[0] if incoming_keys else ''
+            incoming_core = incoming_keys[1] if len(incoming_keys) > 1 else incoming_full
+            if not lgauid or not incoming_name or not incoming_full:
                 continue
 
             for existing_ou in lga_children.get(lgauid, []):
                 existing_name = str(existing_ou.get('name') or '').strip()
-                existing_norm = _norm(existing_name)
-                if not existing_norm:
+                existing_keys = self._build_school_name_match_keys(existing_name)
+                existing_full = existing_keys[0] if existing_keys else ''
+                existing_core = existing_keys[1] if len(existing_keys) > 1 else existing_full
+                if not existing_full:
                     continue
-                if incoming_norm == existing_norm:
+
+                if incoming_full == existing_full:
                     match_type = 'EXACT'
-                elif incoming_norm in existing_norm or existing_norm in incoming_norm:
+                elif incoming_core and existing_core and incoming_core == existing_core:
+                    match_type = 'EXACT_CORE'
+                elif incoming_full in existing_full or existing_full in incoming_full:
                     match_type = 'PARTIAL'
+                elif incoming_core and existing_core and (incoming_core in existing_core or existing_core in incoming_core):
+                    match_type = 'PARTIAL_CORE'
                 else:
                     continue
-                matches.append({
+
+                match_key = (incoming_code, str(existing_ou.get('id') or '').strip())
+                match_row = {
                     'incoming_school_name': incoming_name,
                     'incoming_school_code': incoming_code,
                     'lgauid': lgauid,
@@ -1232,10 +1348,15 @@ class SchoolCodeGenerator:
                     'matched_dhis2_name': existing_name,
                     'matched_dhis2_code': str(existing_ou.get('code') or ''),
                     'matched_dhis2_uid': str(existing_ou.get('id') or ''),
-                    'match_type': match_type
-                })
+                    'match_type': match_type,
+                    'match_basis': 'core_name' if 'CORE' in match_type else 'full_name'
+                }
 
-        return matches
+                current = seen_matches.get(match_key)
+                if current is None or _match_rank(match_type) > _match_rank(current.get('match_type')):
+                    seen_matches[match_key] = match_row
+
+        return list(seen_matches.values())
 
     def post_new_schools_to_dhis2(self, base_url, username, password, intake_df, dry_run=False, batch_size=100, duplicate_matches=None):
         def _safe_response_payload(response):
@@ -1246,6 +1367,9 @@ class SchoolCodeGenerator:
 
         def _normalize_name(name_value):
             return re.sub(r'\s+', ' ', str(name_value or '').strip().lower())
+
+        def _match_keys(name_value):
+            return self._build_school_name_match_keys(name_value)
 
         def _clean_dhis_uid(uid_value):
             uid_text = str(uid_value or '').strip()
@@ -1332,31 +1456,36 @@ class SchoolCodeGenerator:
             if not duplicate_rows:
                 return existing_by_lga_name
 
+            def _match_rank(match_type):
+                rank_map = {
+                    'EXACT': 4,
+                    'EXACT_CORE': 3,
+                    'PARTIAL': 2,
+                    'PARTIAL_CORE': 1
+                }
+                return rank_map.get(str(match_type or '').upper(), 0)
+
             for item in duplicate_rows:
                 lgauid = _clean_dhis_uid((item or {}).get('lgauid'))
-                incoming_school_name = _normalize_name((item or {}).get('incoming_school_name'))
+                incoming_name_keys = _match_keys((item or {}).get('incoming_school_name'))
                 matched_uid = str((item or {}).get('matched_dhis2_uid') or '').strip()
                 matched_name = str((item or {}).get('matched_dhis2_name') or '').strip()
                 matched_code = str((item or {}).get('matched_dhis2_code') or '').strip()
-                if not lgauid or not incoming_school_name or not matched_uid:
+                candidate_match_type = str((item or {}).get('match_type') or '').upper()
+                if not lgauid or not incoming_name_keys or not matched_uid:
                     continue
 
-                key = (lgauid, incoming_school_name)
-                current = existing_by_lga_name.get(key)
                 candidate = {
                     'id': matched_uid,
                     'code': matched_code,
-                    'name': matched_name
+                    'name': matched_name,
+                    'match_type': candidate_match_type
                 }
-                if current is None:
-                    existing_by_lga_name[key] = candidate
-                    continue
-
-                current_match_type = str((current or {}).get('match_type') or '').upper()
-                candidate_match_type = str((item or {}).get('match_type') or '').upper()
-                if current_match_type != 'EXACT' and candidate_match_type == 'EXACT':
-                    candidate['match_type'] = candidate_match_type
-                    existing_by_lga_name[key] = candidate
+                for name_key in incoming_name_keys:
+                    key = (lgauid, name_key)
+                    current = existing_by_lga_name.get(key)
+                    if current is None or _match_rank(candidate_match_type) > _match_rank(current.get('match_type')):
+                        existing_by_lga_name[key] = candidate
 
             return existing_by_lga_name
 
@@ -1399,23 +1528,24 @@ class SchoolCodeGenerator:
                     existing_parent_uid = _clean_dhis_uid((((ou or {}).get('parent') or {}).get('id')))
                     if existing_parent_uid != parent_uid:
                         continue
-                    normalized_name = _normalize_name((ou or {}).get('name'))
-                    if not normalized_name:
+                    name_keys = _match_keys((ou or {}).get('name'))
+                    if not name_keys:
                         continue
 
-                    key = (parent_uid, normalized_name)
-                    current = existing_by_parent_name.get(key)
-                    if current is None:
-                        existing_by_parent_name[key] = ou
-                        continue
+                    for name_key in name_keys:
+                        key = (parent_uid, name_key)
+                        current = existing_by_parent_name.get(key)
+                        if current is None:
+                            existing_by_parent_name[key] = ou
+                            continue
 
-                    # Prefer OU that already has a 10-digit code.
-                    current_code = str((current or {}).get('code') or '').strip()
-                    candidate_code = str((ou or {}).get('code') or '').strip()
-                    current_valid = bool(re.fullmatch(r'\d{10}', current_code))
-                    candidate_valid = bool(re.fullmatch(r'\d{10}', candidate_code))
-                    if candidate_valid and not current_valid:
-                        existing_by_parent_name[key] = ou
+                        # Prefer OU that already has a 10-digit code.
+                        current_code = str((current or {}).get('code') or '').strip()
+                        candidate_code = str((ou or {}).get('code') or '').strip()
+                        current_valid = bool(re.fullmatch(r'\d{10}', current_code))
+                        candidate_valid = bool(re.fullmatch(r'\d{10}', candidate_code))
+                        if candidate_valid and not current_valid:
+                            existing_by_parent_name[key] = ou
 
             return existing_by_parent_name
 
@@ -1500,10 +1630,17 @@ class SchoolCodeGenerator:
             opening_date = str(row.get('openingdate', '') or '').strip() or '2024-01-01'
 
             existing = existing_by_code.get(school_code)
-            if not existing and parent_uid and school_name:
-                existing = existing_name_matches_by_parent.get((parent_uid, _normalize_name(school_name)))
-            if not existing and lga_uid and school_name:
-                existing = existing_name_matches_by_lga.get((lga_uid, _normalize_name(school_name)))
+            school_name_keys = _match_keys(school_name)
+            if not existing and parent_uid and school_name_keys:
+                for school_name_key in school_name_keys:
+                    existing = existing_name_matches_by_parent.get((parent_uid, school_name_key))
+                    if existing:
+                        break
+            if not existing and lga_uid and school_name_keys:
+                for school_name_key in school_name_keys:
+                    existing = existing_name_matches_by_lga.get((lga_uid, school_name_key))
+                    if existing:
+                        break
             existing_parent_uid = _clean_dhis_uid((((existing or {}).get('parent') or {}).get('id')))
             resolved_parent_uid = parent_uid or existing_parent_uid
 
@@ -1980,20 +2117,45 @@ class SchoolCodeGenerator:
 
         return f"{base}/api"
 
-    def _dhis_request(self, method, base_url, username, password, endpoint, params=None, json_data=None, timeout=60):
+    def _dhis_request(self, method, base_url, username, password, endpoint, params=None, json_data=None, timeout=60, max_retries=3):
         api_base = self._normalize_dhis_api_base(base_url)
         url = f"{api_base}{endpoint}"
-        response = requests.request(
-            method=method,
-            url=url,
-            params=params,
-            json=json_data,
-            auth=(username, password),
-            timeout=timeout,
-            headers={"Accept": "application/json"}
-        )
-        response.raise_for_status()
-        return response
+
+        # Use explicit connect/read timeouts for better behavior on slow DHIS2 responses.
+        request_timeout = timeout if isinstance(timeout, tuple) else (10, timeout)
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = requests.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    auth=(username, password),
+                    timeout=request_timeout,
+                    headers={"Accept": "application/json"}
+                )
+
+                # Retry transient server/network pressure responses.
+                if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+
+                response.raise_for_status()
+                return response
+
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                retriable = isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+                if not retriable or attempt >= max_retries:
+                    raise
+                time.sleep(min(2 ** attempt, 8))
+
+        # Defensive fallback (loop should normally return or raise above).
+        if last_error:
+            raise last_error
+        raise requests.exceptions.RequestException("DHIS2 request failed")
 
     def fetch_level2_ous(self, base_url, username, password):
         params = {
@@ -2018,11 +2180,11 @@ class SchoolCodeGenerator:
         on_progress(fetched, total_pages, page) is called after each page if provided."""
         all_ous = []
         page = 1
-        page_size = 1000
+        page_size = 300
         total_pages = None
         while True:
             params = {
-                "fields": "id,name,code,shortName,openingDate,closedDate,geometry,parent[id]",
+                "fields": "id,name,code,parent[id]",
                 "filter": [
                     "level:eq:5",
                     f"path:like:/{level2_id}"
@@ -2038,7 +2200,9 @@ class SchoolCodeGenerator:
                 username=username,
                 password=password,
                 endpoint="/organisationUnits",
-                params=params
+                params=params,
+                timeout=(10, 120),
+                max_retries=4
             )
             data = response.json()
             ous = data.get("organisationUnits", [])
@@ -2670,6 +2834,7 @@ def new_school_intake_ui(generator):
             st.session_state['new_intake_original_stats'] = original_stats
             st.session_state['new_intake_processing_stats'] = processing_stats
             st.session_state['new_intake_original_name'] = intake_file.name
+            st.session_state['new_intake_focus_publish_tab'] = False
 
     if 'new_intake_result_df' in st.session_state:
         display_new_school_intake_results(
@@ -2686,13 +2851,25 @@ def new_school_intake_ui(generator):
 def display_new_school_intake_results(generator, result_df, original_name, original_stats, processing_stats, base_url, username, password):
     st.success(f"✅ Intake processed for {len(result_df)} schools")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    focus_publish_tab = bool(st.session_state.get('new_intake_focus_publish_tab', False))
+    tab_labels = [
         "📊 Overview",
         "🧭 Resolution",
         "🔢 Serial Allocation",
         "📥 Download",
         "🚀 Publish"
-    ])
+    ]
+    if focus_publish_tab:
+        tab_labels = ["🚀 Publish", "📊 Overview", "🧭 Resolution", "🔢 Serial Allocation", "📥 Download"]
+
+    tabs = st.tabs(tab_labels)
+    tab_by_label = dict(zip(tab_labels, tabs))
+
+    tab1 = tab_by_label["📊 Overview"]
+    tab2 = tab_by_label["🧭 Resolution"]
+    tab3 = tab_by_label["🔢 Serial Allocation"]
+    tab4 = tab_by_label["📥 Download"]
+    tab5 = tab_by_label["🚀 Publish"]
 
     with tab1:
         col1, col2, col3, col4 = st.columns(4)
@@ -2878,6 +3055,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
 
     with tab5:
         ready_df = result_df[result_df['can_post'].astype(bool)] if 'can_post' in result_df.columns else pd.DataFrame()
+        file_stub = str(original_name).split('.')[0]
         st.metric("Rows Ready To Publish", len(ready_df))
         if ready_df.empty:
             st.info("No rows are ready to publish. Resolve all required fields first.")
@@ -2924,22 +3102,29 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
 
         # ── Duplicate check ──────────────────────────────────────────────────
         st.subheader("Step 1 — Check for Duplicate Schools on DNEMIS")
-        st.caption("Queries DNEMIS for existing Level-5 OUs under the same LGA as each new-create row and flags name matches.")
+        st.caption(
+            "Queries DNEMIS for existing Level-5 OUs under the same LGA as each new-create row and flags name matches. "
+            "Matching uses two rules: (1) **full name** — the complete normalised school name; "
+            "(2) **core name** — the name with school-level prefix (e.g. JSS, SSS, PRY, TVET, PVT, IQS) "
+            "and trailing code suffix (e.g. *(AB1234CD)*) removed. Both exact and partial matches are checked under each rule."
+        )
 
         col_check, col_clear = st.columns([2, 1])
         with col_check:
             run_dup_check = st.button("🔍 Check for Duplicates on DNEMIS", key='new_intake_dup_check_button')
         with col_clear:
             if st.button("Clear duplicate check results", key='new_intake_dup_clear_button'):
+                st.session_state['new_intake_focus_publish_tab'] = True
                 st.session_state.pop('new_intake_dup_results', None)
                 st.session_state.pop('new_intake_dup_check_signature', None)
                 st.rerun()
 
         if run_dup_check:
+            st.session_state['new_intake_focus_publish_tab'] = True
             if not base_url or not username or not password:
                 st.error("Please provide DHIS2 credentials before checking.")
             else:
-                with st.spinner("Checking DNEMIS for duplicate school names in each LGA..."):
+                with st.spinner("Checking DNEMIS for duplicate school names (full name and core name, ignoring prefix/suffix) in each LGA..."):
                     try:
                         dup_matches = generator.check_duplicate_names_on_dhis2(
                             base_url=base_url,
@@ -2949,6 +3134,8 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                         )
                         st.session_state['new_intake_dup_results'] = dup_matches
                         st.session_state['new_intake_dup_check_signature'] = create_codes_signature
+                        # Re-render with Publish-first tab order after check completes.
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Duplicate check failed: {e}")
 
@@ -2956,6 +3143,17 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         dup_check_signature = st.session_state.get('new_intake_dup_check_signature', '')
         duplicate_check_run_for_current = (dup_results is not None) and (dup_check_signature == create_codes_signature)
         duplicates_acknowledged = True  # default: allow publish when check not yet run
+        duplicate_school_codes = {
+            str(item.get('incoming_school_code') or '').strip()
+            for item in (dup_results or [])
+            if str(item.get('incoming_school_code') or '').strip()
+        } if duplicate_check_run_for_current else set()
+        duplicate_matched_create_df = create_scope_df[
+            create_scope_df['school_code'].astype(str).str.strip().isin(duplicate_school_codes)
+        ].copy() if ('school_code' in create_scope_df.columns and duplicate_check_run_for_current) else pd.DataFrame()
+        duplicate_free_create_df = create_scope_df[
+            ~create_scope_df['school_code'].astype(str).str.strip().isin(duplicate_school_codes)
+        ].copy() if ('school_code' in create_scope_df.columns and duplicate_check_run_for_current) else pd.DataFrame()
 
         if dup_results is not None:
             if len(dup_results) == 0:
@@ -2965,21 +3163,111 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                 dup_df = pd.DataFrame(dup_results)
                 st.dataframe(dup_df, use_container_width=True)
 
-                # Separate exact vs partial
-                exact_count = sum(1 for d in dup_results if d.get('match_type') == 'EXACT')
-                partial_count = len(dup_results) - exact_count
-                if exact_count:
-                    st.error(f"{exact_count} EXACT name match(es) — these schools likely already exist.")
-                if partial_count:
-                    st.warning(f"{partial_count} PARTIAL name match(es) — review carefully.")
+                # Separate exact vs partial, and full-name vs core-name
+                exact_full   = sum(1 for d in dup_results if d.get('match_type') == 'EXACT'      and d.get('match_basis') != 'core_name')
+                exact_core   = sum(1 for d in dup_results if d.get('match_type') == 'EXACT_CORE' or  (d.get('match_type') == 'EXACT' and d.get('match_basis') == 'core_name'))
+                partial_full = sum(1 for d in dup_results if d.get('match_type') == 'PARTIAL'    and d.get('match_basis') != 'core_name')
+                partial_core = sum(1 for d in dup_results if d.get('match_type') in ('PARTIAL_CORE',) or (d.get('match_type') == 'PARTIAL' and d.get('match_basis') == 'core_name'))
+                if exact_full:
+                    st.error(f"{exact_full} EXACT full-name match(es) — these schools very likely already exist in DNEMIS.")
+                if exact_core:
+                    st.error(f"{exact_core} EXACT core-name match(es) — same school exists under a different level prefix or without a suffix; confirm before publishing.")
+                if partial_full:
+                    st.warning(f"{partial_full} PARTIAL full-name match(es) — review carefully.")
+                if partial_core:
+                    st.warning(f"{partial_core} PARTIAL core-name match(es) — possible match when prefix/suffix is ignored; review carefully.")
 
                 duplicates_acknowledged = st.checkbox(
-                    "I have reviewed the duplicate results and want to proceed anyway",
+                    "Proceed with publish for non-duplicate rows only (duplicate-matched rows will be skipped)",
+                    value=True,
                     key='new_intake_dup_acknowledge'
                 )
 
+        if duplicate_check_run_for_current:
+            st.subheader("Step 1b — Create Rows With No Duplicate Match")
+            st.caption(
+                "These rows had no DNEMIS duplicate match under either the full-name or core-name rule. "
+                "They may still be blocked by other quality checks before publish."
+            )
+
+            col_no_dup, col_with_dup = st.columns(2)
+            with col_no_dup:
+                st.metric("Create Rows Without Duplicates", len(duplicate_free_create_df))
+            with col_with_dup:
+                st.metric("Create Rows With Duplicate Matches", len(duplicate_school_codes))
+
+            if duplicate_free_create_df.empty:
+                st.info("No create rows remain after duplicate matches are excluded for the current check.")
+            else:
+                no_duplicate_preview_columns = [
+                    column for column in [
+                        'school_name', 'school_code', 'school_level', 'school_level_normalized',
+                        'state', 'lga', 'ward', 'reference_lga', 'parentuid_for_create',
+                        'parent_match_type', 'parent_match_score', 'openingdate'
+                    ] if column in duplicate_free_create_df.columns
+                ]
+                st.dataframe(
+                    duplicate_free_create_df[no_duplicate_preview_columns],
+                    use_container_width=True
+                )
+                download_col1, download_col2 = st.columns(2)
+                with download_col1:
+                    st.download_button(
+                        label="📄 Donwload Schools Without Duplicates",
+                        data=duplicate_free_create_df.to_csv(index=False),
+                        file_name=f"new_school_intake_no_duplicates_{file_stub}.csv",
+                        mime='text/csv',
+                        use_container_width=True
+                    )
+                with download_col2:
+                    st.download_button(
+                        label="📄 Download Schools With Duplicates",
+                        data=duplicate_matched_create_df.to_csv(index=False),
+                        file_name=f"new_school_intake_with_duplicates_{file_stub}.csv",
+                        mime='text/csv',
+                        use_container_width=True
+                    )
+
+        publish_ready_df = ready_df.copy()
+        publish_excluded_duplicates_df = pd.DataFrame()
+        gated_create_scope_df = create_scope_df.copy()
+
+        if duplicate_check_run_for_current and 'school_code' in ready_df.columns and 'school_ou_uid' in ready_df.columns:
+            ready_create_mask = ready_df['school_ou_uid'].astype(str).str.strip().eq('')
+            ready_duplicate_mask = ready_df['school_code'].astype(str).str.strip().isin(duplicate_school_codes)
+            publish_excluded_duplicates_df = ready_df[ready_create_mask & ready_duplicate_mask].copy()
+            publish_ready_df = ready_df[~(ready_create_mask & ready_duplicate_mask)].copy()
+
+            if 'school_code' in create_scope_df.columns:
+                gated_create_scope_df = create_scope_df[
+                    ~create_scope_df['school_code'].astype(str).str.strip().isin(duplicate_school_codes)
+                ].copy()
+
+        if 'name_format_valid' in gated_create_scope_df.columns:
+            gated_invalid_level_create_df = gated_create_scope_df[~gated_create_scope_df['name_format_valid'].astype(bool)].copy()
+        else:
+            gated_invalid_level_create_df = pd.DataFrame()
+
+        if 'parent_match_type' in gated_create_scope_df.columns and 'parent_match_score' in gated_create_scope_df.columns:
+            gated_low_confidence_create_df = gated_create_scope_df[
+                gated_create_scope_df['parent_match_type'].astype(str).eq('fuzzy_ward') &
+                (pd.to_numeric(gated_create_scope_df['parent_match_score'], errors='coerce').fillna(0) < float(generator.parent_match_confident_threshold))
+            ].copy()
+        else:
+            gated_low_confidence_create_df = pd.DataFrame()
+
         # ── Publish ──────────────────────────────────────────────────────────
         st.subheader("Step 2 — Publish to DNEMIS")
+
+        if duplicate_check_run_for_current:
+            if len(publish_excluded_duplicates_df) > 0:
+                st.info(
+                    f"Publish scope adjusted: {len(publish_excluded_duplicates_df)} create row(s) with duplicate matches are excluded. "
+                    f"You can continue with {len(publish_ready_df)} non-duplicate row(s), while reviewing/rerunning duplicates from Step 1b."
+                )
+            else:
+                st.success(f"All {len(publish_ready_df)} ready row(s) are currently eligible for publish (no duplicate exclusions applied).")
+
         strict_publish_gate = st.checkbox(
             "Strict gate: block publish unless duplicate-check was run, school_level is valid, and fuzzy parent matches are high confidence",
             value=True,
@@ -2987,31 +3275,31 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         )
 
         if strict_publish_gate:
-            if len(create_scope_df) > 0 and not duplicate_check_run_for_current:
+            if len(gated_create_scope_df) > 0 and not duplicate_check_run_for_current:
                 st.info("Strict gate active: run duplicate-check for the current create rows before publishing.")
 
-            if len(invalid_level_create_df) > 0:
+            if len(gated_invalid_level_create_df) > 0:
                 st.error(
-                    f"Strict gate active: {len(invalid_level_create_df)} create row(s) have missing/invalid school_level prefix and must be fixed."
+                    f"Strict gate active: {len(gated_invalid_level_create_df)} create row(s) have missing/invalid school_level prefix and must be fixed."
                 )
                 invalid_preview_columns = [
                     column for column in ['school_name', 'school_level', 'school_level_normalized', 'school_code', 'state', 'lga']
-                    if column in invalid_level_create_df.columns
+                    if column in gated_invalid_level_create_df.columns
                 ]
-                st.dataframe(invalid_level_create_df[invalid_preview_columns].head(20), use_container_width=True)
+                st.dataframe(gated_invalid_level_create_df[invalid_preview_columns].head(20), use_container_width=True)
 
-            if len(low_confidence_create_df) > 0:
+            if len(gated_low_confidence_create_df) > 0:
                 st.warning(
-                    f"Strict gate active: {len(low_confidence_create_df)} create row(s) have fuzzy parent-match score below "
+                    f"Strict gate active: {len(gated_low_confidence_create_df)} create row(s) have fuzzy parent-match score below "
                     f"{int(generator.parent_match_confident_threshold)}."
                 )
                 confidence_preview_columns = [
                     column for column in [
                         'school_name', 'state', 'lga', 'ward', 'reference_ward',
                         'parent_match_type', 'parent_match_score', 'parentuid_for_create', 'match_notes'
-                    ] if column in low_confidence_create_df.columns
+                    ] if column in gated_low_confidence_create_df.columns
                 ]
-                st.dataframe(low_confidence_create_df[confidence_preview_columns].head(20), use_container_width=True)
+                st.dataframe(gated_low_confidence_create_df[confidence_preview_columns].head(20), use_container_width=True)
 
         dry_run = st.checkbox("Dry run only (recommended first)", value=True, key='new_intake_publish_dry_run')
         confirm_publish = st.checkbox("I confirm I want to create or update these schools on DNEMIS", key='new_intake_publish_confirm')
@@ -3042,7 +3330,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
             )
             return hashlib.sha256(payload_text.encode('utf-8')).hexdigest()[:20]
 
-        publish_request_id = _build_publish_request_id(ready_df)
+        publish_request_id = _build_publish_request_id(publish_ready_df)
         publish_in_progress = bool(st.session_state.get('new_intake_publish_in_progress', False))
         publish_history = st.session_state.get('new_intake_publish_history', {})
         prior_result = publish_history.get(publish_request_id, {}) if publish_request_id else {}
@@ -3051,12 +3339,16 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
 
         publish_disabled = not duplicates_acknowledged
         if strict_publish_gate:
-            if len(create_scope_df) > 0 and not duplicate_check_run_for_current:
+            if len(gated_create_scope_df) > 0 and not duplicate_check_run_for_current:
                 publish_disabled = True
-            if len(invalid_level_create_df) > 0:
+            if len(gated_invalid_level_create_df) > 0:
                 publish_disabled = True
-            if len(low_confidence_create_df) > 0:
+            if len(gated_low_confidence_create_df) > 0:
                 publish_disabled = True
+
+        if len(publish_ready_df) == 0:
+            publish_disabled = True
+            st.info("No eligible rows remain for this publish action after applying duplicate exclusions and quality checks.")
 
         if publish_in_progress:
             publish_disabled = True
@@ -3073,6 +3365,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
             st.info("Publish is blocked by quality checks. Resolve the messages above.")
 
         if st.button("Post New Schools to DNEMIS", type='primary', key='new_intake_publish_button', disabled=publish_disabled):
+            st.session_state['new_intake_focus_publish_tab'] = True
             if not base_url or not username or not password:
                 st.error("Please provide DHIS2 credentials before publishing.")
                 return
@@ -3100,7 +3393,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                         base_url=base_url,
                         username=username,
                         password=password,
-                        intake_df=ready_df,
+                        intake_df=publish_ready_df,
                         dry_run=dry_run,
                         batch_size=100,
                         duplicate_matches=dup_results if duplicate_check_run_for_current else None
