@@ -6,6 +6,7 @@ import re
 import requests
 import hashlib
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from io import BytesIO
@@ -570,7 +571,48 @@ class SchoolCodeGenerator:
             return []
 
         def _norm(value):
-            return re.sub(r'[\s\W]+', ' ', str(value or '').lower()).strip()
+            cleaned = re.sub(r'[\s\W]+', ' ', str(value or '').lower()).strip()
+            if not cleaned:
+                return ''
+
+            # Canonicalize common abbreviations used in school names.
+            token_aliases = {
+                'st': 'saint',
+                'mt': 'mount',
+                'sec': 'secondary',
+                'sch': 'school',
+                'intl': 'international',
+                'mr': 'mister',
+                'mister': 'mister',
+                'dr': 'doctor',
+                'doctor': 'doctor',
+                'ms': 'missus',
+                'mrs': 'missus',
+                'missus': 'missus',
+                'sr': 'senior',
+                'jr': 'junior',
+                # Treat PR/Pastor/Professor as same canonical token to reduce title-format variance.
+                'pr': 'pr',
+                'prof': 'pr',
+                'pastor': 'pr',
+                'professor': 'pr',
+                'govt': 'government'
+            }
+            compound_aliases = {
+                'gdjss': ['government', 'day', 'junior', 'secondary', 'school'],
+                'gdss': ['government', 'day', 'secondary', 'school'],
+                'gss': ['government', 'secondary', 'school'],
+                'gsss': ['government', 'senior', 'secondary', 'school'],
+                'ggss': ['government', 'girls', 'secondary', 'school'],
+            }
+
+            tokens = []
+            for token in cleaned.split():
+                if token in compound_aliases:
+                    tokens.extend(compound_aliases[token])
+                else:
+                    tokens.append(token_aliases.get(token, token))
+            return ' '.join(tokens).strip()
 
         keys = []
         full_key = _norm(name_text)
@@ -614,6 +656,98 @@ class SchoolCodeGenerator:
             os.path.join(base_dir, self.ou_reference_filename),
             os.path.join(base_dir, "school_app", "etc", self.ou_reference_filename),
         ]
+
+    def _get_posting_audit_log_path(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base_dir, "school_app", "etc", "posting_audit_log.csv")
+
+    def _empty_posting_audit_df(self):
+        return pd.DataFrame(columns=[
+            'posted_at_utc', 'posted_by', 'request_id', 'publish_status',
+            'school_code', 'state', 'lga', 'lgacode', 'reference_lga', 'reference_ward'
+        ])
+
+    def load_posting_audit_log(self):
+        audit_path = self._get_posting_audit_log_path()
+        if not os.path.exists(audit_path):
+            return self._empty_posting_audit_df()
+
+        try:
+            audit_df = pd.read_csv(audit_path, dtype=str).fillna('')
+        except Exception:
+            return self._empty_posting_audit_df()
+
+        expected_columns = self._empty_posting_audit_df().columns.tolist()
+        for column in expected_columns:
+            if column not in audit_df.columns:
+                audit_df[column] = ''
+        return audit_df[expected_columns]
+
+    def append_posting_audit_log(self, posted_by, publish_df, publish_result, request_id=''):
+        """Append successful COMMIT posting rows to persistent audit log.
+
+        Returns number of school rows appended.
+        """
+        status = str((publish_result or {}).get('status') or '').upper().strip()
+        if status not in {'POSTED', 'POSTED_WITH_WARNING'}:
+            return 0
+        if publish_df is None or len(publish_df) == 0:
+            return 0
+
+        required_columns = ['school_code', 'school_name', 'parentuid_for_create']
+        for column in required_columns:
+            if column not in publish_df.columns:
+                return 0
+
+        rows_to_log = publish_df[
+            publish_df['school_code'].astype(str).str.match(r'^\d{10}$') &
+            publish_df['school_name'].astype(str).str.strip().ne('') &
+            publish_df['parentuid_for_create'].astype(str).str.strip().ne('')
+        ].copy()
+        if len(rows_to_log) == 0:
+            return 0
+
+        response_payload = (publish_result or {}).get('response', {}) or {}
+        skipped = response_payload.get('skipped', [])
+        skipped_codes = set()
+        if isinstance(skipped, list):
+            for item in skipped:
+                item_code = str((item or {}).get('school_code') or '').strip()
+                if re.fullmatch(r'\d{10}', item_code):
+                    skipped_codes.add(item_code)
+
+        if skipped_codes:
+            rows_to_log = rows_to_log[
+                ~rows_to_log['school_code'].astype(str).str.strip().isin(skipped_codes)
+            ].copy()
+        if len(rows_to_log) == 0:
+            return 0
+
+        rows_to_log = rows_to_log.drop_duplicates(subset=['school_code']).copy()
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        actor = str(posted_by or '').strip() or 'unknown'
+        req_id = str(request_id or '').strip()
+
+        audit_rows = pd.DataFrame({
+            'posted_at_utc': [timestamp] * len(rows_to_log),
+            'posted_by': [actor] * len(rows_to_log),
+            'request_id': [req_id] * len(rows_to_log),
+            'publish_status': [status] * len(rows_to_log),
+            'school_code': rows_to_log['school_code'].astype(str).str.strip().tolist(),
+            'state': rows_to_log['state'].astype(str).str.strip().tolist() if 'state' in rows_to_log.columns else [''] * len(rows_to_log),
+            'lga': rows_to_log['lga'].astype(str).str.strip().tolist() if 'lga' in rows_to_log.columns else [''] * len(rows_to_log),
+            'lgacode': rows_to_log['lgacode'].astype(str).str.strip().tolist() if 'lgacode' in rows_to_log.columns else [''] * len(rows_to_log),
+            'reference_lga': rows_to_log['reference_lga'].astype(str).str.strip().tolist() if 'reference_lga' in rows_to_log.columns else [''] * len(rows_to_log),
+            'reference_ward': rows_to_log['reference_ward'].astype(str).str.strip().tolist() if 'reference_ward' in rows_to_log.columns else [''] * len(rows_to_log),
+        })
+
+        audit_path = self._get_posting_audit_log_path()
+        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
+
+        existing = self.load_posting_audit_log()
+        combined = pd.concat([existing, audit_rows], ignore_index=True)
+        combined.to_csv(audit_path, index=False)
+        return int(len(audit_rows))
 
     def _get_secret_or_env(self, key):
         value = ""
@@ -1492,8 +1626,9 @@ class SchoolCodeGenerator:
 
     def check_duplicate_names_on_dhis2(self, base_url, username, password, intake_df):
         """
-        For every row in intake_df that is flagged for CREATE (no existing UID yet),
-        query DHIS2 for all Level-5 OUs under the same LGA and return name-match details.
+                For every row in intake_df that is flagged for CREATE (no existing UID yet),
+                query DHIS2 for all Level-5 OUs under the same LGA and also compare rows inside
+                the current upload set using the same name rules.
 
         Returns a list of dicts:
           incoming_school_name, incoming_school_code, lgauid, reference_lga,
@@ -1511,8 +1646,8 @@ class SchoolCodeGenerator:
         def _meaningful_core_tokens(core_key):
             stop_tokens = {
                 'school', 'college', 'secondary', 'primary', 'junior', 'senior', 'high',
-                'academy', 'international', 'government', 'community', 'comprehensive',
-                'grammar', 'private', 'public', 'model', 'annex', 'annexe', 'institute',
+                'international', 'government', 'community', 'comprehensive',
+                'private', 'public', 'model', 'annex', 'annexe', 'institute',
                 'centre', 'center', 'the', 'and', 'of'
             }
             return {
@@ -1520,7 +1655,7 @@ class SchoolCodeGenerator:
                 if len(token) >= 3 and token not in stop_tokens
             }
 
-        def _is_valid_partial_core_match(incoming_core_key, existing_core_key):
+        def _is_valid_partial_core_match(incoming_core_key, existing_core_key, lga_text=''):
             if not incoming_core_key or not existing_core_key:
                 return False
 
@@ -1529,18 +1664,68 @@ class SchoolCodeGenerator:
 
             incoming_tokens = _meaningful_core_tokens(incoming_core_key)
             existing_tokens = _meaningful_core_tokens(existing_core_key)
-            overlap_count = len(incoming_tokens.intersection(existing_tokens))
+            overlap_tokens = incoming_tokens.intersection(existing_tokens)
+            overlap_count = len(overlap_tokens)
 
-            # Guard against location-only overlaps (e.g., "Badagry") creating false duplicates.
-            if overlap_count < 2:
-                return False
+            lga_tokens = _meaningful_core_tokens(self._normalize_text(lga_text))
 
-            return True
+            # Strong overlap remains a duplicate signal.
+            if overlap_count >= 2:
+                return True
+
+            # Allow one-token containment only when token is distinctive and not only location text.
+            if overlap_count == 1:
+                only_token = next(iter(overlap_tokens))
+                if only_token in lga_tokens:
+                    return False
+
+                # One side having a single meaningful token (for example "avatar academy" inside
+                # "avatar academy ...") should still be treated as duplicate.
+                if min(len(incoming_tokens), len(existing_tokens)) == 1 and len(only_token) >= 5:
+                    return True
+
+            return False
+
+        def _normalize_bucket_text(value):
+            return self._normalize_text(str(value or '')).strip()
+
+        def _comparison_bucket_key(row):
+            lgauid = str(row.get('lgauid') or '').strip()
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9]{10}', lgauid):
+                return ('lgauid', lgauid)
+
+            state_key = _normalize_bucket_text(row.get('state'))
+            lga_key = _normalize_bucket_text(row.get('reference_lga') or row.get('lga'))
+            if state_key or lga_key:
+                return ('state_lga', state_key, lga_key)
+
+            return None
+
+        def _resolve_match_type(incoming_name, incoming_full, incoming_core, existing_name, existing_full, existing_core, lga_text=''):
+            if not existing_full:
+                return ''
+
+            # Business rule: JSS and SSS with same core name are distinct schools.
+            if self._is_jss_sss_prefix_conflict(incoming_name, existing_name):
+                return ''
+
+            if incoming_full == existing_full:
+                return 'EXACT'
+            if incoming_core and existing_core and incoming_core == existing_core:
+                return 'EXACT_CORE'
+            if incoming_full in existing_full or existing_full in incoming_full:
+                return 'PARTIAL'
+            if _is_valid_partial_core_match(incoming_core, existing_core, lga_text=lga_text):
+                return 'PARTIAL_CORE'
+
+            return ''
 
         create_rows = intake_df[
             intake_df.get('can_post', intake_df.index.isin(intake_df.index)).astype(bool) &
             intake_df['school_ou_uid'].apply(lambda v: not str(v or '').strip())
         ].copy() if 'school_ou_uid' in intake_df.columns else intake_df.copy()
+
+        create_rows = create_rows.reset_index(drop=True).copy()
 
         unique_lga_uids = [
             uid for uid in create_rows['lgauid'].dropna().unique()
@@ -1603,22 +1788,16 @@ class SchoolCodeGenerator:
                 existing_keys = self._build_school_name_match_keys(existing_name)
                 existing_full = existing_keys[0] if existing_keys else ''
                 existing_core = existing_keys[1] if len(existing_keys) > 1 else existing_full
-                if not existing_full:
-                    continue
-
-                # Business rule: JSS and SSS with same core name are distinct schools.
-                if self._is_jss_sss_prefix_conflict(incoming_name, existing_name):
-                    continue
-
-                if incoming_full == existing_full:
-                    match_type = 'EXACT'
-                elif incoming_core and existing_core and incoming_core == existing_core:
-                    match_type = 'EXACT_CORE'
-                elif incoming_full in existing_full or existing_full in incoming_full:
-                    match_type = 'PARTIAL'
-                elif _is_valid_partial_core_match(incoming_core, existing_core):
-                    match_type = 'PARTIAL_CORE'
-                else:
+                match_type = _resolve_match_type(
+                    incoming_name=incoming_name,
+                    incoming_full=incoming_full,
+                    incoming_core=incoming_core,
+                    existing_name=existing_name,
+                    existing_full=existing_full,
+                    existing_core=existing_core,
+                    lga_text=str(row.get('reference_lga') or row.get('lga') or '')
+                )
+                if not match_type:
                     continue
 
                 match_key = (incoming_code, str(existing_ou.get('id') or '').strip())
@@ -1632,6 +1811,7 @@ class SchoolCodeGenerator:
                     'matched_dhis2_name': existing_name,
                     'matched_dhis2_code': str(existing_ou.get('code') or ''),
                     'matched_dhis2_uid': str(existing_ou.get('id') or ''),
+                    'match_source': 'DNEMIS',
                     'match_type': match_type,
                     'match_basis': 'core_name' if 'CORE' in match_type else 'full_name'
                 }
@@ -1639,6 +1819,88 @@ class SchoolCodeGenerator:
                 current = seen_matches.get(match_key)
                 if current is None or _match_rank(match_type) > _match_rank(current.get('match_type')):
                     seen_matches[match_key] = match_row
+
+        upload_buckets = {}
+        for row_index, row in create_rows.iterrows():
+            bucket_key = _comparison_bucket_key(row)
+            if bucket_key is None:
+                continue
+            upload_buckets.setdefault(bucket_key, []).append((row_index, row))
+
+        for bucket_rows in upload_buckets.values():
+            if len(bucket_rows) < 2:
+                continue
+
+            for left_pos in range(len(bucket_rows) - 1):
+                left_index, left_row = bucket_rows[left_pos]
+                left_name = str(left_row.get('school_name') or '').strip()
+                left_code = str(left_row.get('school_code') or '').strip()
+                left_keys = self._build_school_name_match_keys(left_name)
+                left_full = left_keys[0] if left_keys else ''
+                left_core = left_keys[1] if len(left_keys) > 1 else left_full
+                if not left_name or not left_code or not left_full:
+                    continue
+
+                for right_pos in range(left_pos + 1, len(bucket_rows)):
+                    right_index, right_row = bucket_rows[right_pos]
+                    right_name = str(right_row.get('school_name') or '').strip()
+                    right_code = str(right_row.get('school_code') or '').strip()
+                    if not right_name or not right_code or left_code == right_code:
+                        continue
+
+                    right_keys = self._build_school_name_match_keys(right_name)
+                    right_full = right_keys[0] if right_keys else ''
+                    right_core = right_keys[1] if len(right_keys) > 1 else right_full
+                    match_type = _resolve_match_type(
+                        incoming_name=left_name,
+                        incoming_full=left_full,
+                        incoming_core=left_core,
+                        existing_name=right_name,
+                        existing_full=right_full,
+                        existing_core=right_core,
+                        lga_text=str(left_row.get('reference_lga') or left_row.get('lga') or '')
+                    )
+                    if not match_type:
+                        continue
+
+                    forward_key = (left_code, f'UPLOAD::{right_code}')
+                    reverse_key = (right_code, f'UPLOAD::{left_code}')
+                    forward_row = {
+                        'incoming_school_name': left_name,
+                        'incoming_school_code': left_code,
+                        'lgauid': str(left_row.get('lgauid') or ''),
+                        'reference_lga': str(left_row.get('reference_lga') or left_row.get('lga') or ''),
+                        'dhis2_warduid': str(left_row.get('warduid') or left_row.get('parentuid_for_create') or ''),
+                        'dhis2_wardname': str(left_row.get('reference_ward') or left_row.get('ward') or ''),
+                        'matched_dhis2_name': right_name,
+                        'matched_dhis2_code': right_code,
+                        'matched_dhis2_uid': '',
+                        'match_source': 'Current upload',
+                        'match_type': match_type,
+                        'match_basis': 'core_name' if 'CORE' in match_type else 'full_name'
+                    }
+                    reverse_row = {
+                        'incoming_school_name': right_name,
+                        'incoming_school_code': right_code,
+                        'lgauid': str(right_row.get('lgauid') or ''),
+                        'reference_lga': str(right_row.get('reference_lga') or right_row.get('lga') or ''),
+                        'dhis2_warduid': str(right_row.get('warduid') or right_row.get('parentuid_for_create') or ''),
+                        'dhis2_wardname': str(right_row.get('reference_ward') or right_row.get('ward') or ''),
+                        'matched_dhis2_name': left_name,
+                        'matched_dhis2_code': left_code,
+                        'matched_dhis2_uid': '',
+                        'match_source': 'Current upload',
+                        'match_type': match_type,
+                        'match_basis': 'core_name' if 'CORE' in match_type else 'full_name'
+                    }
+
+                    current_forward = seen_matches.get(forward_key)
+                    if current_forward is None or _match_rank(match_type) > _match_rank(current_forward.get('match_type')):
+                        seen_matches[forward_key] = forward_row
+
+                    current_reverse = seen_matches.get(reverse_key)
+                    if current_reverse is None or _match_rank(match_type) > _match_rank(current_reverse.get('match_type')):
+                        seen_matches[reverse_key] = reverse_row
 
         match_rows = list(seen_matches.values())
         if not match_rows:
@@ -1665,6 +1927,71 @@ class SchoolCodeGenerator:
             item['dhis2_duplicate_count'] = len(duplicate_count_by_incoming.get(incoming_key, set()))
 
         return match_rows
+
+    def apply_existing_name_matches_to_result_df(self, result_df, duplicate_rows):
+        if result_df is None or len(result_df) == 0:
+            return result_df, 0
+
+        updated_df = result_df.copy()
+        for column in ['existing_name_match_uid', 'existing_name_match_name', 'existing_name_match_type']:
+            if column not in updated_df.columns:
+                updated_df[column] = ''
+
+        if 'school_code' not in updated_df.columns:
+            return updated_df, 0
+
+        def _rank(match_type):
+            rank_map = {
+                'EXACT': 4,
+                'EXACT_CORE': 3,
+                'PARTIAL': 2,
+                'PARTIAL_CORE': 1
+            }
+            return rank_map.get(str(match_type or '').upper(), 0)
+
+        best_match_by_code = {}
+        for item in (duplicate_rows or []):
+            if str(item.get('match_source') or '').strip() != 'DNEMIS':
+                continue
+
+            match_type = str(item.get('match_type') or '').strip().upper()
+            if match_type not in {'EXACT', 'EXACT_CORE'}:
+                continue
+
+            incoming_code = str(item.get('incoming_school_code') or '').strip()
+            matched_uid = str(item.get('matched_dhis2_uid') or '').strip()
+            if not incoming_code or not matched_uid:
+                continue
+
+            current = best_match_by_code.get(incoming_code)
+            if current is None or _rank(match_type) > _rank(current.get('match_type')):
+                best_match_by_code[incoming_code] = item
+
+        auto_classified_count = 0
+        for idx, row in updated_df.iterrows():
+            school_code = str(row.get('school_code') or '').strip()
+            matched_item = best_match_by_code.get(school_code)
+            if not matched_item:
+                continue
+
+            matched_uid = str(matched_item.get('matched_dhis2_uid') or '').strip()
+            matched_name = str(matched_item.get('matched_dhis2_name') or '').strip()
+            matched_type = str(matched_item.get('match_type') or '').strip().upper()
+
+            updated_df.at[idx, 'existing_name_match_uid'] = matched_uid
+            updated_df.at[idx, 'existing_name_match_name'] = matched_name
+            updated_df.at[idx, 'existing_name_match_type'] = matched_type
+            updated_df.at[idx, 'school_ou_uid'] = matched_uid
+            updated_df.at[idx, 'can_post'] = False
+
+            existing_notes = str(updated_df.at[idx, 'match_notes'] or '').strip()
+            auto_note = f"Existing DNEMIS school matched by name ({matched_type}): {matched_name}"
+            if auto_note not in existing_notes:
+                updated_df.at[idx, 'match_notes'] = f"{existing_notes}; {auto_note}".strip('; ').strip()
+
+            auto_classified_count += 1
+
+        return updated_df, auto_classified_count
 
     def post_new_schools_to_dhis2(self, base_url, username, password, intake_df, dry_run=False, batch_size=100, duplicate_matches=None):
         is_dry_run = bool(dry_run)
@@ -3306,6 +3633,9 @@ def new_school_intake_ui(generator):
             password=password
         )
 
+    st.divider()
+    render_posting_activity_summary(generator)
+
 def display_new_school_intake_results(generator, result_df, original_name, original_stats, processing_stats, base_url, username, password):
     st.success(f"✅ Intake processed for {len(result_df)} schools")
 
@@ -3546,6 +3876,12 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         create_codes_signature = '|'.join(sorted(create_scope_df['school_code'].astype(str).tolist())) if 'school_code' in create_scope_df.columns else ''
         update_count_preview = len(ready_df) - len(create_df)
         st.caption(f"{len(create_df)} new create(s), {update_count_preview} update(s) in ready set.")
+        auto_existing_name_match_count = int(processing_stats.get('auto_existing_name_match_count', 0) or 0)
+        if auto_existing_name_match_count > 0:
+            st.info(
+                f"{auto_existing_name_match_count} row(s) were auto-classified as already existing in DNEMIS "
+                "from EXACT/EXACT_CORE name matches and removed from create/publish."
+            )
 
         ready_preview_columns = [
             column for column in [
@@ -3561,7 +3897,8 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
         # ── Duplicate check ──────────────────────────────────────────────────
         st.subheader("Step 1 — Check for Duplicate Schools on DNEMIS")
         st.caption(
-            "Queries DNEMIS for existing Level-5 OUs under the same LGA as each new-create row and flags name matches. "
+            "Checks for possible duplicates against DNEMIS and inside the current upload set. "
+            "DNEMIS matches are checked under the same resolved LGA; upload-set matches fall back to state plus reference LGA/LGA when no LGA UID is available. "
             "Matching uses two rules: (1) **full name** — the complete normalised school name; "
             "(2) **core name** — the name with school-level prefix (e.g. JSS, SSS, PRY, TVET, PVT, IQS) "
             "and trailing code suffix (e.g. *(AB1234CD)*) removed. Both exact and partial matches are checked under each rule."
@@ -3590,8 +3927,24 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                             password=password,
                             intake_df=ready_df
                         )
+                        updated_result_df, auto_classified_count = generator.apply_existing_name_matches_to_result_df(
+                            result_df,
+                            dup_matches
+                        )
+                        updated_create_scope_df = updated_result_df[
+                            updated_result_df['school_code'].astype(str).str.match(r'^\d{10}$') &
+                            updated_result_df['school_ou_uid'].astype(str).str.strip().eq('')
+                        ].copy() if ('school_code' in updated_result_df.columns and 'school_ou_uid' in updated_result_df.columns) else pd.DataFrame()
+                        updated_create_codes_signature = '|'.join(sorted(updated_create_scope_df['school_code'].astype(str).tolist())) if 'school_code' in updated_create_scope_df.columns else ''
+
+                        updated_processing_stats = dict(processing_stats or {})
+                        updated_processing_stats['ready_to_post_count'] = int(updated_result_df['can_post'].astype(bool).sum()) if 'can_post' in updated_result_df.columns else 0
+                        updated_processing_stats['auto_existing_name_match_count'] = int(auto_classified_count)
+
+                        st.session_state['new_intake_result_df'] = updated_result_df
+                        st.session_state['new_intake_processing_stats'] = updated_processing_stats
                         st.session_state['new_intake_dup_results'] = dup_matches
-                        st.session_state['new_intake_dup_check_signature'] = create_codes_signature
+                        st.session_state['new_intake_dup_check_signature'] = updated_create_codes_signature
                         # Re-render with Publish-first tab order after check completes.
                         st.rerun()
                     except Exception as e:
@@ -3627,7 +3980,7 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                     )
                 dup_display_columns = [
                     column for column in [
-                        'incoming_school_name', 'dhis2_duplicate_count', 'incoming_school_code', 'lgauid', 'reference_lga',
+                        'incoming_school_name', 'dhis2_duplicate_count', 'incoming_school_code', 'match_source', 'lgauid', 'reference_lga',
                         'dhis2_warduid', 'dhis2_wardname',
                         'matched_dhis2_name', 'matched_dhis2_code', 'matched_dhis2_uid',
                         'match_type', 'match_basis'
@@ -3939,6 +4292,18 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                 compact_publish_result['response'] = compact_response
                 compact_publish_result['_populated_count'] = populated_count if 'populated_count' in locals() else 0
 
+                if str(compact_publish_result.get('status', '')).upper() in {'POSTED', 'POSTED_WITH_WARNING'} and not dry_run:
+                    try:
+                        audit_rows = generator.append_posting_audit_log(
+                            posted_by=username,
+                            publish_df=publish_ready_df,
+                            publish_result=compact_publish_result,
+                            request_id=publish_request_id
+                        )
+                        compact_publish_result['_audit_rows_logged'] = int(audit_rows)
+                    except Exception as audit_error:
+                        compact_publish_result['_audit_error'] = str(audit_error)
+
                 # Persist compact result so it survives reruns with lower memory footprint.
                 st.session_state['new_intake_publish_result'] = compact_publish_result
 
@@ -3978,7 +4343,74 @@ def display_new_school_intake_results(generator, result_df, original_name, origi
                     st.caption(f"school_ou_uid populated for {populated_count} row(s) from DNEMIS response.")
             if pr.get('request_id'):
                 st.caption(f"Publish request ID: {pr.get('request_id')}")
+            if pr.get('_audit_rows_logged') is not None:
+                st.caption(f"Posting audit logged for {int(pr.get('_audit_rows_logged') or 0)} school row(s).")
+            if pr.get('_audit_error'):
+                st.warning(f"Posting audit log warning: {pr.get('_audit_error')}")
             st.json(pr.get('response', {}))
+
+
+def render_posting_activity_summary(generator):
+    st.subheader("Posting Activity Summary")
+    audit_df = generator.load_posting_audit_log()
+    if audit_df.empty:
+        st.info("No committed posting activity has been logged yet.")
+        return
+
+    audit_df = audit_df.fillna('')
+    total_posted_rows = int(len(audit_df))
+    total_post_events = int(audit_df['request_id'].astype(str).str.strip().replace('', pd.NA).dropna().nunique())
+    if total_post_events == 0:
+        total_post_events = int(audit_df['posted_at_utc'].astype(str).str.strip().replace('', pd.NA).dropna().nunique())
+    distinct_users = int(audit_df['posted_by'].astype(str).str.strip().replace('', pd.NA).dropna().nunique())
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    with metric_col1:
+        st.metric("Schools Posted", total_posted_rows)
+    with metric_col2:
+        st.metric("Posting Events", total_post_events)
+    with metric_col3:
+        st.metric("Users", distinct_users)
+
+    # Prepare display dataframe with formatted timestamps
+    display_df = audit_df.copy()
+    display_df['posted_at_utc'] = pd.to_datetime(display_df['posted_at_utc'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # User filter
+    st.caption("Filter by User")
+    all_users = sorted(display_df['posted_by'].astype(str).str.strip().unique())
+    selected_users = st.multiselect(
+        "Select users to display (leave empty for all):",
+        options=all_users,
+        default=all_users,
+        key="posting_user_filter"
+    )
+    
+    if selected_users:
+        filtered_df = display_df[display_df['posted_by'].astype(str).str.strip().isin(selected_users)].copy()
+    else:
+        filtered_df = display_df.copy()
+    
+    # Sort by posted_at_utc descending (most recent first)
+    filtered_df = filtered_df.sort_values('posted_at_utc', ascending=False)
+    
+    # Select columns to display
+    display_columns = ['posted_at_utc', 'posted_by', 'state', 'lga', 'school_code', 'reference_ward']
+    display_columns = [col for col in display_columns if col in filtered_df.columns]
+    table_df = filtered_df[display_columns].reset_index(drop=True)
+    
+    # Display table
+    st.caption("Posted Schools Log")
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+    
+    # Download button
+    csv_data = table_df.to_csv(index=False)
+    st.download_button(
+        label="📥 Download as CSV",
+        data=csv_data,
+        file_name=f"posting_activity_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv"
+    )
 
 def display_school_list_results(result_df, original_file, original_stats, processing_stats, duplicates):
     st.success(f"✅ Successfully processed {len(result_df)} schools!")
